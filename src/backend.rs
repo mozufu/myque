@@ -2,6 +2,7 @@ use crate::eligibility::{plan_dispatch, DispatchPlan, SkipReason};
 use crate::model::{AgentConfig, Config, Status, Task};
 use crate::store::{atomic_write, now_rfc3339, StoreError, StoredTask, TaskStore};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -91,10 +92,54 @@ pub enum BackendError {
     },
 }
 
+pub struct BackendRegistry {
+    backends: HashMap<String, Box<dyn AgentBackend>>,
+}
+
+impl BackendRegistry {
+    /// Registry preloaded with myque's built-in backends.
+    pub fn with_builtins() -> Self {
+        let mut reg = Self {
+            backends: HashMap::new(),
+        };
+        reg.register(Box::new(NoopBackend));
+        reg.register(Box::new(ShellBackend));
+        reg
+    }
+
+    /// Register a backend, keyed by its `name()`. Overrides any existing entry
+    /// with the same name (so callers may replace `shell`/`noop` if desired).
+    pub fn register(&mut self, backend: Box<dyn AgentBackend>) {
+        self.backends.insert(backend.name().to_owned(), backend);
+    }
+
+    fn get(&self, name: &str) -> Result<&dyn AgentBackend, BackendError> {
+        self.backends
+            .get(name)
+            .map(|b| b.as_ref())
+            .ok_or_else(|| BackendError::UnknownBackend(name.to_owned()))
+    }
+}
+
+impl Default for BackendRegistry {
+    fn default() -> Self {
+        Self::with_builtins()
+    }
+}
+
 pub fn dispatch(
     store: &TaskStore,
     config: &Config,
     dry_run: bool,
+) -> Result<DispatchOutcome, BackendError> {
+    dispatch_with(store, config, dry_run, &BackendRegistry::with_builtins())
+}
+
+pub fn dispatch_with(
+    store: &TaskStore,
+    config: &Config,
+    dry_run: bool,
+    registry: &BackendRegistry,
 ) -> Result<DispatchOutcome, BackendError> {
     let mut plan = plan_dispatch(store, config, dry_run)?;
     if dry_run {
@@ -111,7 +156,7 @@ pub fn dispatch(
     for task_id in plan.selected.clone() {
         let stored = store.get_task(&task_id)?;
         let backend_name = backend_name_for(&stored.task, config).to_owned();
-        let backend = backend_for(&backend_name)?;
+        let backend = registry.get(&backend_name)?;
         let decision = backend.can_run(&stored.task, config);
         if !decision.allowed {
             rejected.push((
@@ -318,14 +363,6 @@ pub fn read_run_record(store: &TaskStore, run_id: &str) -> Result<RunRecord, Sto
     toml::from_str(&raw).map_err(|source| StoreError::InvalidConfig { path, source })
 }
 
-fn backend_for(name: &str) -> Result<Box<dyn AgentBackend>, BackendError> {
-    match name {
-        "noop" => Ok(Box::new(NoopBackend)),
-        "shell" => Ok(Box::new(ShellBackend)),
-        other => Err(BackendError::UnknownBackend(other.to_owned())),
-    }
-}
-
 fn backend_name_for<'a>(task: &'a Task, config: &'a Config) -> &'a str {
     agent_config(task, config)
         .map(|agent| agent.backend.as_str())
@@ -370,4 +407,190 @@ fn next_run_id(store: &TaskStore, task_id: &str) -> Result<String, StoreError> {
         }
     }
     Ok(format!("run-{stamp}-{safe_task}-overflow"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{AgentConfig, BackendConfig};
+    use std::sync::{Arc, Mutex};
+    use tempfile::TempDir;
+
+    struct StubBackend {
+        name: &'static str,
+        dispatched: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl AgentBackend for StubBackend {
+        fn name(&self) -> &'static str {
+            self.name
+        }
+
+        fn can_run(&self, _task: &Task, _config: &Config) -> BackendDecision {
+            BackendDecision::allowed()
+        }
+
+        fn dispatch(&self, _task: &StoredTask, _config: &Config, run_id: String) -> DispatchResult {
+            self.dispatched.lock().unwrap().push(run_id.clone());
+            DispatchResult {
+                run_id,
+                started: true,
+                message: "stub accepted task".to_owned(),
+                ended_at: None,
+                exit_code: None,
+            }
+        }
+
+        fn status(&self, run_id: &str, _config: &Config) -> RunStatus {
+            RunStatus {
+                run_id: run_id.to_owned(),
+                status: "running".to_owned(),
+                message: None,
+            }
+        }
+
+        fn cancel(&self, _run_id: &str, _config: &Config) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    fn write_task_file(store: &TaskStore, id: &str, backend: &str) {
+        let raw = format!(
+            r#"+++
+id = "{id}"
+title = "Title {id}"
+status = "ready"
+priority = 1
+order = 100
+labels = ["safe-auto"]
+agent = "coder"
+backend = "{backend}"
+depends_on = []
+allowed_auto_dispatch = true
+attempts = 0
+max_attempts = 2
+created_at = "2026-06-22T00:00:00Z"
+updated_at = "2026-06-22T00:00:00Z"
++++
+
+## Goal
+
+Finish {id}.
+
+## Context
+
+Test fixture.
+
+## Constraints
+
+Stay local.
+
+## Acceptance
+
+- Observable result exists.
+"#
+        );
+        fs::write(store.tasks_dir().join(format!("{id}.md")), raw).unwrap();
+    }
+
+    fn config_with_agent_backend(backend: &str) -> Config {
+        let mut config = Config::default();
+        config.agents.insert(
+            "coder".to_owned(),
+            AgentConfig {
+                backend: backend.to_owned(),
+                command: None,
+            },
+        );
+        if backend != "noop" && backend != "shell" {
+            config.backends.insert(
+                backend.to_owned(),
+                BackendConfig {
+                    kind: "external".to_owned(),
+                },
+            );
+        }
+        config
+    }
+
+    fn store_with_task(id: &str, backend: &str) -> (TempDir, TaskStore) {
+        let tmp = TempDir::new().unwrap();
+        let store = TaskStore::new(tmp.path());
+        store.init(false).unwrap();
+        write_task_file(&store, id, backend);
+        (tmp, store)
+    }
+
+    #[test]
+    fn dispatch_with_routes_to_registered_backend() {
+        let (_tmp, store) = store_with_task("task-container", "container");
+        let config = config_with_agent_backend("container");
+
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = BackendRegistry::with_builtins();
+        registry.register(Box::new(StubBackend {
+            name: "container",
+            dispatched: dispatched.clone(),
+        }));
+
+        let outcome = dispatch_with(&store, &config, false, &registry).unwrap();
+
+        assert_eq!(outcome.started.len(), 1);
+        assert_eq!(outcome.started[0].backend, "container");
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+
+        let stored = store.get_task("task-container").unwrap();
+        assert_eq!(stored.task.status, Status::Running);
+        assert_eq!(stored.task.attempts, 1);
+        assert!(stored.task.last_run_id.is_some());
+    }
+
+    #[test]
+    fn dispatch_with_override_replaces_builtin() {
+        let (_tmp, store) = store_with_task("task-shell", "shell");
+        let config = config_with_agent_backend("shell");
+
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = BackendRegistry::with_builtins();
+        registry.register(Box::new(StubBackend {
+            name: "shell",
+            dispatched: dispatched.clone(),
+        }));
+
+        // The built-in ShellBackend would reject (no command configured); the
+        // stub accepts. A started task proves the override is invoked.
+        let outcome = dispatch_with(&store, &config, false, &registry).unwrap();
+
+        assert_eq!(outcome.started.len(), 1);
+        assert!(outcome.rejected.is_empty());
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_with_unknown_backend_propagates_error() {
+        let (_tmp, store) = store_with_task("task-missing", "missing");
+        let config = config_with_agent_backend("missing");
+
+        let registry = BackendRegistry::with_builtins();
+        let err = dispatch_with(&store, &config, false, &registry).unwrap_err();
+
+        assert!(matches!(err, BackendError::UnknownBackend(name) if name == "missing"));
+    }
+
+    #[test]
+    fn dispatch_wrapper_preserves_builtin_behavior() {
+        let (_tmp, store) = store_with_task("task-noop", "noop");
+        let config = config_with_agent_backend("noop");
+
+        let outcome = dispatch(&store, &config, false).unwrap();
+
+        assert_eq!(outcome.started.len(), 1);
+        assert_eq!(outcome.started[0].backend, "noop");
+
+        let stored = store.get_task("task-noop").unwrap();
+        assert_eq!(stored.task.status, Status::Running);
+        assert_eq!(stored.task.attempts, 1);
+        let run_id = stored.task.last_run_id.clone().unwrap();
+        assert!(store.runs_dir().join(format!("{run_id}.toml")).exists());
+    }
 }

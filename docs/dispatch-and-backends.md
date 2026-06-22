@@ -144,3 +144,20 @@ Rules:
 - Do not invoke shell commands through unescaped string concatenation.
 - Capture command, exit code, start/end timestamps, and stdout/stderr paths or summaries.
 - Failed process start should leave the task `ready` or move it to `failed` according to policy.
+
+## Caller-injectable backends
+
+MyQue ships only the `noop` and `shell` backends, but an embedding program can register its own `AgentBackend` implementation without MyQue depending on it.
+
+`BackendRegistry` owns the built-in backends plus any caller-registered ones, keyed by `AgentBackend::name()`. `dispatch_with` runs the normal dispatch algorithm against a supplied registry; `dispatch` is a thin wrapper that uses a builtins-only registry.
+
+```rust
+let mut registry = myque::BackendRegistry::with_builtins();
+registry.register(Box::new(ContainerBackend { /* ... */ })); // name() -> "container"
+let outcome = myque::dispatch_with(&store, &config, false, &registry)?;
+```
+
+- A registered backend whose `name()` matches an existing entry (e.g. `shell`) replaces it.
+- A task routes to a backend by its agent config: `[agents.<name>] backend = "container"` resolves to the `"container"` backend.
+- Eligibility still requires the resolved backend to be `noop`/`shell` or present in `[backends.<name>]`. If eligibility selects a task whose backend is not registered, `dispatch_with` returns `BackendError::UnknownBackend` and aborts the run.
+- Dispatch is synchronous, single-threaded filesystem work. From async code call `dispatch_with` inside `tokio::task::spawn_blocking`.
