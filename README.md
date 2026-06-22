@@ -16,6 +16,8 @@ It stores one Markdown file per task, renders those files as a Kanban-style boar
 
 ## Install and build
 
+MyQue uses the Rust 2024 edition, so building from source requires Rust 1.85 or newer.
+
 Use the Nix flake for a reproducible development shell:
 
 ```sh
