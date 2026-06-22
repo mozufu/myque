@@ -2,7 +2,7 @@
 ///
 /// All public functions return `Vec<ValidationError>` — callers receive every
 /// problem in one pass rather than stopping at the first failure.
-use crate::frontmatter::{extract_sections, FrontmatterError};
+use crate::frontmatter::{FrontmatterError, extract_sections};
 use crate::model::{Config, Status, Task};
 use std::collections::HashMap;
 
@@ -380,9 +380,11 @@ mod tests {
         // Omit `title` by replacing it with nothing.
         let raw = "+++\nid = \"t-001\"\nstatus = \"ready\"\npriority = 1\norder = 100\nlabels = []\nagent = \"coder\"\nbackend = \"noop\"\ndepends_on = []\nallowed_auto_dispatch = false\nattempts = 0\nmax_attempts = 2\ncreated_at = \"2026-06-22T00:00:00Z\"\nupdated_at = \"2026-06-22T00:00:00Z\"\n+++\n\n## Goal\n\nHi.\n";
         let errs = validate_task_file(raw, "t-001.md").unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| e.code == ErrorCode::TaskMissingRequiredField && e.message.contains("title")));
+        assert!(
+            errs.iter()
+                .any(|e| e.code == ErrorCode::TaskMissingRequiredField
+                    && e.message.contains("title"))
+        );
     }
 
     #[test]
@@ -415,9 +417,10 @@ mod tests {
         // allowed_auto_dispatch = true but no ## Acceptance content.
         let raw = make_raw(&[], "", "## Goal\n\nDo it.\n");
         let errs = validate_task_file(&raw, "t-001.md").unwrap_err();
-        assert!(errs
-            .iter()
-            .any(|e| e.code == ErrorCode::TaskEmptyAcceptance));
+        assert!(
+            errs.iter()
+                .any(|e| e.code == ErrorCode::TaskEmptyAcceptance)
+        );
     }
 
     #[test]

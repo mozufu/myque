@@ -1,7 +1,7 @@
 use crate::backend::{self, DispatchOutcome, RunRecord};
-use crate::board::{render_board_with_options, render_task_list, BoardOptions, BoardStyle};
+use crate::board::{BoardOptions, BoardStyle, render_board_with_options, render_task_list};
 use crate::eligibility::{
-    plan_dispatch_for_tasks, skip_reason_text, DispatchPlan, EligibilityDecision, SkipReason,
+    DispatchPlan, EligibilityDecision, SkipReason, plan_dispatch_for_tasks, skip_reason_text,
 };
 use crate::model::{Config, Status, Task};
 use crate::store::{CreateTaskInput, StoredTask, TaskStore};

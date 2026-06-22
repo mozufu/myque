@@ -1,4 +1,4 @@
-use crate::frontmatter::{parse_task_file, write_task_file, FrontmatterError};
+use crate::frontmatter::{FrontmatterError, parse_task_file, write_task_file};
 use crate::model::{AgentConfig, BackendConfig, Config, Status, Task, TaskFrontmatter};
 use crate::validation::{self, ValidationError};
 use chrono::Utc;
