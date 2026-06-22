@@ -168,6 +168,11 @@ impl TaskStore {
         Config::load_or_default(&self.root)
     }
 
+    pub fn write_config(&self, config: &Config) -> StoreResult<()> {
+        let raw = toml::to_string_pretty(config).expect("config serializes");
+        atomic_write(&self.config_path(), raw.as_bytes())
+    }
+
     pub fn load_tasks(&self) -> StoreResult<Vec<StoredTask>> {
         let paths = self.task_paths()?;
         let mut tasks = Vec::with_capacity(paths.len());

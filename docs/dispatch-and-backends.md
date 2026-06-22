@@ -51,15 +51,25 @@ Skipped:
 
 For each accepted task, MyQue:
 
-1. Calls the backend `dispatch` operation.
+1. Calls the backend `dispatch(task, config, run_id)` operation.
 2. Increments `attempts`.
-3. Sets `status = "running"` if dispatch started.
-4. Sets `last_run_id`.
-5. Sets `assigned_at`.
-6. Updates `updated_at`.
-7. Writes a run record under `.myque/runs/`.
+3. Sets `last_run_id` and `assigned_at`.
+4. Chooses the task status from the dispatch result:
+   - no `ended_at` returned → the run is still in flight → `running`;
+   - `ended_at` with `exit_code == 0` → `done`;
+   - `ended_at` with any other or missing exit code → `failed`.
+5. Sets `completed_at` and `updated_at` from `ended_at` for terminal runs.
+6. Writes a run record under `.myque/runs/` whose `status` mirrors the task
+   status (`started`, `done`, or `failed`).
 
-If a backend rejects a task before start, MyQue does not mark it `running`. The reason is reported in command output.
+A backend that runs the task to completion reports `ended_at`/`exit_code`, so the
+task lands directly in `done`/`failed`; the caller-supplied `chilin` backend works
+this way. An asynchronous backend that only starts work returns no `ended_at`,
+leaving the task `running` until a later status update.
+
+If a backend rejects a task before start (`started == false`), MyQue does not mark
+it `running`, increment `attempts`, or write a run record. The reason is reported
+in command output.
 
 ## Run records
 
@@ -82,6 +92,21 @@ ended_at = ""
 message = "noop backend accepted task"
 ```
 
+A backend that finishes synchronously records a terminal run, including the exit
+code:
+
+```toml
+id = "run-2026-06-22-002"
+task_id = "task-2026-06-22-002"
+backend = "chilin"
+agent = "ci"
+status = "failed"
+started_at = "2026-06-22T12:11:00Z"
+ended_at = "2026-06-22T12:11:03Z"
+message = "chilin command failed with exit 1; log=data/ci/logs/owner/repo/run-2.log"
+exit_code = 1
+```
+
 Task files track current state. Run records track execution history.
 
 ## Backend contract
@@ -97,7 +122,11 @@ type BackendDecision = {
 type DispatchResult = {
   runId: string;
   started: boolean;
-  message?: string;
+  message: string;
+  // Present when the backend ran the task to completion. MyQue uses these to
+  // mark the task done/failed; absent means the run is still in flight.
+  endedAt?: string;
+  exitCode?: number;
 };
 
 type RunStatus = {
@@ -109,7 +138,8 @@ type RunStatus = {
 interface AgentBackend {
   name: string;
   canRun(task: TaskCard, config: Config): Promise<BackendDecision>;
-  dispatch(task: TaskCard, config: Config): Promise<DispatchResult>;
+  // MyQue generates the run id and passes it in; the backend reports the outcome.
+  dispatch(task: TaskCard, config: Config, runId: string): Promise<DispatchResult>;
   status(runId: string, config: Config): Promise<RunStatus>;
   cancel(runId: string, config: Config): Promise<void>;
 }
@@ -143,7 +173,8 @@ Rules:
 - Replace only known placeholders such as `{task_file}`, `{task_id}`, and `{workspace}`.
 - Do not invoke shell commands through unescaped string concatenation.
 - Capture command, exit code, start/end timestamps, and stdout/stderr paths or summaries.
-- Failed process start should leave the task `ready` or move it to `failed` according to policy.
+- A successful command reports `started = true` with `ended_at`/`exit_code`, so MyQue marks the task `done`.
+- A nonzero exit or a failed process start reports `started = false`, so MyQue rejects the dispatch and leaves the task `ready` (attempts unchanged).
 
 ## Caller-injectable backends
 
@@ -153,11 +184,11 @@ MyQue ships only the `noop` and `shell` backends, but an embedding program can r
 
 ```rust
 let mut registry = myque::BackendRegistry::with_builtins();
-registry.register(Box::new(ContainerBackend { /* ... */ })); // name() -> "container"
+registry.register(Box::new(chilin::ChilinRunner::new(runner, log_dir))); // name() -> "chilin"
 let outcome = myque::dispatch_with(&store, &config, false, &registry)?;
 ```
 
 - A registered backend whose `name()` matches an existing entry (e.g. `shell`) replaces it.
-- A task routes to a backend by its agent config: `[agents.<name>] backend = "container"` resolves to the `"container"` backend.
+- A task routes to a backend by its agent config: `[agents.<name>] backend = "chilin"` resolves to the `"chilin"` backend.
 - Eligibility still requires the resolved backend to be `noop`/`shell` or present in `[backends.<name>]`. If eligibility selects a task whose backend is not registered, `dispatch_with` returns `BackendError::UnknownBackend` and aborts the run.
 - Dispatch is synchronous, single-threaded filesystem work. From async code call `dispatch_with` inside `tokio::task::spawn_blocking`.

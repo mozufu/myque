@@ -184,23 +184,39 @@ pub fn dispatch_with(
 
         let started_at = now_rfc3339();
         let mut updated = stored.clone();
+        let final_status = dispatch_result.ended_at.as_ref().map(|_| {
+            if dispatch_result.exit_code == Some(0) {
+                Status::Done
+            } else {
+                Status::Failed
+            }
+        });
+        let task_status = final_status.clone().unwrap_or(Status::Running);
         updated.task.attempts = updated.task.attempts.saturating_add(1);
-        updated.task.status = Status::Running;
+        updated.task.status = task_status.clone();
         updated.task.last_run_id = Some(run_id.clone());
         updated.task.assigned_at = Some(started_at.clone());
-        updated.task.updated_at = started_at.clone();
+        updated.task.updated_at = dispatch_result
+            .ended_at
+            .clone()
+            .unwrap_or_else(|| started_at.clone());
+        updated.task.completed_at = dispatch_result.ended_at.clone();
         updated.frontmatter.attempts = Some(updated.task.attempts);
-        updated.frontmatter.status = Some(Status::Running.to_string());
+        updated.frontmatter.status = Some(task_status.to_string());
         updated.frontmatter.last_run_id = Some(run_id.clone());
         updated.frontmatter.assigned_at = Some(started_at.clone());
-        updated.frontmatter.updated_at = Some(started_at.clone());
-
+        updated.frontmatter.updated_at = Some(updated.task.updated_at.clone());
+        updated.frontmatter.completed_at = updated.task.completed_at.clone();
+        let run_status = final_status
+            .as_ref()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "started".to_owned());
         let record = RunRecord {
             id: run_id,
             task_id: updated.task.id.clone(),
             backend: backend_name,
             agent: updated.task.agent.clone(),
-            status: "started".to_owned(),
+            status: run_status,
             started_at,
             ended_at: dispatch_result.ended_at.unwrap_or_default(),
             message: dispatch_result.message,

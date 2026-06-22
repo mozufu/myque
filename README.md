@@ -11,7 +11,7 @@ It stores one Markdown file per task, renders those files as a Kanban-style boar
 - Lists, shows, moves, validates, and renders tasks as a board.
 - Computes which tasks are ready for automated dispatch.
 - Guards dispatch with task-level opt-in, label policy, dependency checks, and attempt limits.
-- Runs through backend adapters, currently including `noop` and `shell`.
+- Runs through backend adapters: built-in `noop` and `shell`, plus any backend an embedding program registers (e.g. `chilin`).
 - Records run metadata separately from task cards.
 
 ## Install and build
