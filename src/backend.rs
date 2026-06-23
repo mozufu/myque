@@ -1,4 +1,4 @@
-use crate::eligibility::{DispatchPlan, SkipReason, plan_dispatch};
+use crate::eligibility::{DispatchPlan, SkipReason, plan_dispatch, skip_reason_text};
 use crate::model::{AgentConfig, Config, Status, Task};
 use crate::store::{StoreError, StoredTask, TaskStore, atomic_write, now_rfc3339};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,55 @@ pub struct RunRecord {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitRunMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GithubRunMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<ChecksRunMetadata>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GitRunMetadata {
+    pub base: String,
+    pub branch: String,
+    pub head_sha: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GithubRunMetadata {
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mergeable: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChecksRunMetadata {
+    pub provider: String,
+    pub state: String,
+    pub required_passed: bool,
+    pub summary: String,
+    pub last_synced_at: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<CheckRunItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckRunItem {
+    pub name: String,
+    pub state: String,
+    #[serde(default)]
+    pub conclusion: String,
+    #[serde(default)]
+    pub url: String,
 }
 
 #[derive(Debug, Clone)]
@@ -80,6 +129,8 @@ pub enum BackendError {
     Store(#[from] StoreError),
     #[error("unknown backend: {0}")]
     UnknownBackend(String),
+    #[error("task {task_id} is not eligible: {reasons}")]
+    TaskIneligible { task_id: String, reasons: String },
     #[error("missing shell command for agent {0}")]
     MissingShellCommand(String),
     #[error("invalid shell command for agent {agent}: {command}")]
@@ -135,15 +186,77 @@ pub fn dispatch(
     dispatch_with(store, config, dry_run, &BackendRegistry::with_builtins())
 }
 
+pub fn dispatch_task(
+    store: &TaskStore,
+    config: &Config,
+    task_id: &str,
+    dry_run: bool,
+) -> Result<DispatchOutcome, BackendError> {
+    dispatch_task_with(
+        store,
+        config,
+        task_id,
+        dry_run,
+        &BackendRegistry::with_builtins(),
+    )
+}
+
+pub fn dispatch_task_with(
+    store: &TaskStore,
+    config: &Config,
+    task_id: &str,
+    dry_run: bool,
+    registry: &BackendRegistry,
+) -> Result<DispatchOutcome, BackendError> {
+    dispatch_selected(store, config, dry_run, registry, Some(task_id))
+}
+
 pub fn dispatch_with(
     store: &TaskStore,
     config: &Config,
     dry_run: bool,
     registry: &BackendRegistry,
 ) -> Result<DispatchOutcome, BackendError> {
+    dispatch_selected(store, config, dry_run, registry, None)
+}
+
+fn dispatch_selected(
+    store: &TaskStore,
+    config: &Config,
+    dry_run: bool,
+    registry: &BackendRegistry,
+    only_task_id: Option<&str>,
+) -> Result<DispatchOutcome, BackendError> {
     let mut plan = plan_dispatch(store, config, dry_run)?;
+    if let Some(task_id) = only_task_id {
+        store.get_task(task_id)?;
+        let decision = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.task_id == task_id)
+            .expect("existing task has dispatch decision");
+        let only_blocked_by_selection_order = decision
+            .reasons
+            .iter()
+            .all(|reason| matches!(reason, SkipReason::ConcurrencyLimit { .. }))
+            && plan.available_slots > 0;
+        let running_requested_task = decision.reasons.iter().all(|reason| {
+            matches!(
+                reason,
+                SkipReason::NotReady {
+                    status: Status::Running
+                }
+            )
+        });
+        if !decision.eligible && !only_blocked_by_selection_order && !running_requested_task {
+            return Err(BackendError::TaskIneligible {
+                task_id: task_id.to_owned(),
+                reasons: join_skip_reasons(&decision.reasons),
+            });
+        }
+        plan.selected = vec![task_id.to_owned()];
+    }
     if dry_run {
-        plan.selected.clear();
         return Ok(DispatchOutcome {
             plan,
             started: Vec::new(),
@@ -221,6 +334,9 @@ pub fn dispatch_with(
             ended_at: dispatch_result.ended_at.unwrap_or_default(),
             message: dispatch_result.message,
             exit_code: dispatch_result.exit_code,
+            git: None,
+            github: None,
+            checks: None,
         };
 
         store.write_task(&updated)?;
@@ -233,6 +349,18 @@ pub fn dispatch_with(
         started,
         rejected,
     })
+}
+
+fn join_skip_reasons(reasons: &[SkipReason]) -> String {
+    if reasons.is_empty() {
+        "no skip reason recorded".to_owned()
+    } else {
+        reasons
+            .iter()
+            .map(skip_reason_text)
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
 }
 
 pub struct NoopBackend;
@@ -608,5 +736,96 @@ Stay local.
         assert_eq!(stored.task.attempts, 1);
         let run_id = stored.task.last_run_id.clone().unwrap();
         assert!(store.runs_dir().join(format!("{run_id}.toml")).exists());
+    }
+
+    #[test]
+    fn dispatch_task_with_dispatches_only_requested_eligible_task() {
+        let (_tmp, store) = store_with_task("task-a", "container");
+        write_task_file(&store, "task-b", "container");
+        let config = config_with_agent_backend("container");
+
+        let dispatched = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = BackendRegistry::with_builtins();
+        registry.register(Box::new(StubBackend {
+            name: "container",
+            dispatched: dispatched.clone(),
+        }));
+
+        let outcome = dispatch_task_with(&store, &config, "task-b", false, &registry).unwrap();
+
+        assert_eq!(outcome.started.len(), 1);
+        assert_eq!(outcome.started[0].task_id, "task-b");
+        assert_eq!(store.get_task("task-a").unwrap().task.status, Status::Ready);
+        assert_eq!(
+            store.get_task("task-b").unwrap().task.status,
+            Status::Running
+        );
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn dispatch_task_with_refuses_ineligible_task() {
+        let (_tmp, store) = store_with_task("task-blocked", "container");
+        store
+            .update_status("task-blocked", Status::Blocked)
+            .expect("status update");
+        let config = config_with_agent_backend("container");
+        let registry = BackendRegistry::with_builtins();
+
+        let err = dispatch_task_with(&store, &config, "task-blocked", false, &registry)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("task task-blocked is not eligible"));
+        assert!(err.contains("status is blocked, not ready"));
+    }
+
+    #[test]
+    fn run_record_round_trips_git_github_and_checks_metadata() {
+        let (_tmp, store) = store_with_task("task-meta", "noop");
+        let record = RunRecord {
+            id: "run-meta".to_owned(),
+            task_id: "task-meta".to_owned(),
+            backend: "chilin".to_owned(),
+            agent: "coder".to_owned(),
+            status: "review".to_owned(),
+            started_at: "2026-06-23T00:00:00Z".to_owned(),
+            ended_at: "2026-06-23T00:01:00Z".to_owned(),
+            message: "ok".to_owned(),
+            exit_code: Some(0),
+            git: Some(GitRunMetadata {
+                base: "main".to_owned(),
+                branch: "myque/task-meta".to_owned(),
+                head_sha: "abc123".to_owned(),
+            }),
+            github: Some(GithubRunMetadata {
+                repo: "mozufu/test".to_owned(),
+                issue: None,
+                pr: Some(7),
+                pr_state: Some("open".to_owned()),
+                draft: Some(true),
+                mergeable: Some("unknown".to_owned()),
+            }),
+            checks: Some(ChecksRunMetadata {
+                provider: "github".to_owned(),
+                state: "pending".to_owned(),
+                required_passed: false,
+                summary: "CI pending".to_owned(),
+                last_synced_at: "2026-06-23T00:02:00Z".to_owned(),
+                items: vec![CheckRunItem {
+                    name: "test".to_owned(),
+                    state: "queued".to_owned(),
+                    conclusion: String::new(),
+                    url: String::new(),
+                }],
+            }),
+        };
+
+        write_run_record(&store, &record).unwrap();
+        let loaded = read_run_record(&store, "run-meta").unwrap();
+
+        assert_eq!(loaded.git.unwrap().branch, "myque/task-meta");
+        assert_eq!(loaded.github.unwrap().pr, Some(7));
+        assert_eq!(loaded.checks.unwrap().state, "pending");
     }
 }

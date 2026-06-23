@@ -394,6 +394,91 @@ fn ready_reports_dependency_and_policy_filters() {
 }
 
 #[test]
+fn ready_json_reports_machine_readable_eligible_tasks() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(
+        &store,
+        "task-ready-json",
+        "Ready JSON",
+        "ready",
+        &["safe-auto"],
+        &[],
+        true,
+    );
+    write_task(
+        &store,
+        "task-blocked-json",
+        "Blocked JSON",
+        "blocked",
+        &["safe-auto"],
+        &[],
+        true,
+    );
+
+    let output = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "ready",
+        "--json",
+    ])
+    .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+    assert_eq!(parsed[0]["id"], "task-ready-json");
+    assert_eq!(parsed[0]["status"], "ready");
+    assert_eq!(parsed[0]["backend"], "noop");
+    assert_eq!(parsed[0]["allowed_auto_dispatch"], true);
+}
+
+#[test]
+fn dispatch_task_flag_only_runs_requested_task() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(
+        &store,
+        "task-first",
+        "First",
+        "ready",
+        &["safe-auto"],
+        &[],
+        true,
+    );
+    write_task(
+        &store,
+        "task-second",
+        "Second",
+        "ready",
+        &["safe-auto"],
+        &[],
+        true,
+    );
+
+    let output = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "dispatch",
+        "--task",
+        "task-second",
+    ])
+    .unwrap();
+
+    assert!(output.contains("task-second"));
+    assert_eq!(
+        store.get_task("task-first").unwrap().task.status,
+        Status::Ready
+    );
+    assert_eq!(
+        store.get_task("task-second").unwrap().task.status,
+        Status::Running
+    );
+}
+#[test]
 fn dry_run_does_not_mutate_task_files_or_runs() {
     let tmp = TempDir::new().unwrap();
     let store = TaskStore::new(tmp.path());

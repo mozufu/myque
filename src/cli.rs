@@ -147,12 +147,19 @@ pub enum Command {
     /// Validate all task files and config.
     Validate,
     /// Print dispatch eligibility without starting a backend.
-    Ready,
+    Ready {
+        /// Emit stable machine-readable task JSON for runner orchestration.
+        #[arg(long)]
+        json: bool,
+    },
     /// Dispatch eligible tasks through configured backends.
     Dispatch {
         /// Print the selected plan and skip reasons without mutating files.
         #[arg(long)]
         dry_run: bool,
+        /// Dispatch only this eligible task.
+        #[arg(long)]
+        task: Option<String>,
     },
 }
 
@@ -340,21 +347,29 @@ pub fn execute(cli: Cli) -> Result<String> {
             let errors = store.validate(&config)?;
             Ok(render_validation(&errors))
         }
-        Command::Ready => {
+        Command::Ready { json } => {
             let config = store.load_config()?;
             let tasks = store.load_tasks()?;
             let plan = plan_dispatch_for_tasks(&tasks, &config, true);
-            Ok(render_ready_report(&tasks, &config, &plan))
-        }
-        Command::Dispatch { dry_run } => {
-            let config = store.load_config()?;
-            if dry_run {
-                let tasks = store.load_tasks()?;
-                let plan = plan_dispatch_for_tasks(&tasks, &config, false);
-                Ok(render_dry_run_report(&tasks, &config, &plan))
+            if json {
+                render_ready_json(&tasks, &config, &plan)
             } else {
-                let tasks = store.load_tasks()?;
-                let outcome = backend::dispatch(&store, &config, false)?;
+                Ok(render_ready_report(&tasks, &config, &plan))
+            }
+        }
+        Command::Dispatch { dry_run, task } => {
+            let config = store.load_config()?;
+            let tasks = store.load_tasks()?;
+            let outcome = if let Some(task_id) = task {
+                backend::dispatch_task(&store, &config, &task_id, dry_run)?
+            } else if dry_run {
+                backend::dispatch(&store, &config, true)?
+            } else {
+                backend::dispatch(&store, &config, false)?
+            };
+            if dry_run {
+                Ok(render_dry_run_report(&tasks, &config, &outcome.plan))
+            } else {
                 Ok(render_dispatch_outcome(&tasks, &config, &outcome))
             }
         }
@@ -433,6 +448,48 @@ fn render_validation(errors: &[crate::validation::ValidationError]) -> String {
         out.push_str(&format!("  {error}\n"));
     }
     out
+}
+
+#[derive(serde::Serialize)]
+struct ReadyTaskJson<'a> {
+    id: &'a str,
+    title: &'a str,
+    status: &'a str,
+    priority: i64,
+    order: i64,
+    labels: &'a [String],
+    agent: &'a str,
+    backend: &'a str,
+    path: String,
+    allowed_auto_dispatch: bool,
+    attempts: u32,
+    max_attempts: u32,
+}
+
+fn render_ready_json(tasks: &[StoredTask], config: &Config, plan: &DispatchPlan) -> Result<String> {
+    let task_map: HashMap<&str, &StoredTask> = tasks
+        .iter()
+        .map(|stored| (stored.task.id.as_str(), stored))
+        .collect();
+    let ready = plan
+        .eligible()
+        .filter_map(|decision| task_map.get(decision.task_id.as_str()).copied())
+        .map(|stored| ReadyTaskJson {
+            id: &stored.task.id,
+            title: &stored.task.title,
+            status: stored.task.status.as_str(),
+            priority: stored.task.priority,
+            order: stored.task.order,
+            labels: &stored.task.labels,
+            agent: &stored.task.agent,
+            backend: effective_backend(&stored.task, config),
+            path: stored.path.display().to_string(),
+            allowed_auto_dispatch: stored.task.allowed_auto_dispatch,
+            attempts: stored.task.attempts,
+            max_attempts: stored.task.max_attempts,
+        })
+        .collect::<Vec<_>>();
+    Ok(format!("{}\n", serde_json::to_string_pretty(&ready)?))
 }
 
 fn render_ready_report(tasks: &[StoredTask], config: &Config, plan: &DispatchPlan) -> String {
