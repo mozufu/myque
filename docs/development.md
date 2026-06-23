@@ -57,6 +57,10 @@ Behavior-focused tests should cover:
 15. Grouping board output by status.
 16. Sorting board output by priority, order, then creation time.
 17. Moving a task updates `status` and `updated_at` without deleting body text.
+18. Editing task frontmatter through the CLI preserves Markdown body text.
+19. Label and dependency CLI mutations are idempotent and validate dependencies.
+20. Section CLI mutations replace only the selected Markdown section.
+21. Worker completion commands preserve body text and enforce `agents_may_mark_done`.
 
 ## Design risks
 

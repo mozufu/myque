@@ -97,6 +97,56 @@ myque move task-2026-06-22-001 review
 
 Unknown statuses are rejected.
 
+## `myque edit <task-id>`
+
+Patches frontmatter fields while preserving the Markdown body.
+
+```sh
+myque edit task-2026-06-22-001 --title "Add retry policy" --priority 1
+myque edit task-2026-06-22-001 --agent coder --backend shell --max-attempts 3
+myque edit task-2026-06-22-001 --allow-auto
+myque edit task-2026-06-22-001 --no-allow-auto
+```
+
+## `myque label <task-id>`
+
+Adds or removes labels idempotently.
+
+```sh
+myque label task-2026-06-22-001 --add safe-auto --add backend
+myque label task-2026-06-22-001 --remove needs-human
+```
+
+## `myque deps <task-id>`
+
+Adds or removes dependencies idempotently. The resulting dependency graph must reference existing tasks and remain acyclic.
+
+```sh
+myque deps task-2026-06-22-001 --add task-2026-06-22-000
+myque deps task-2026-06-22-001 --remove task-2026-06-21-999
+```
+
+## `myque section <task-id> <section>`
+
+Replaces or appends one Markdown section. Supported sections are `goal`, `context`, `constraints`, `acceptance`, `files`, and `notes`.
+
+```sh
+myque section task-2026-06-22-001 acceptance "- Retries transient errors."
+myque section task-2026-06-22-001 files --append '- `src/worker.rs`'
+printf '%s\n' '- New acceptance item' | myque section task-2026-06-22-001 acceptance --stdin
+```
+
+## `myque fail <task-id>` and `myque complete <task-id>`
+
+Worker-friendly lifecycle shortcuts.
+
+```sh
+myque fail task-2026-06-22-001 --reason "tests failed"
+myque complete task-2026-06-22-001
+```
+
+`complete` moves tasks to `review` by default. `complete --done` is rejected unless `policy.agents_may_mark_done = true`.
+
 ## `myque validate`
 
 Validates all task files and config.

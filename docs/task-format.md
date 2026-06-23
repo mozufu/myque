@@ -102,6 +102,8 @@ Optional sections:
 
 When `allowed_auto_dispatch = true`, MyQue requires a non-empty `## Acceptance` section by default.
 
+Agents and workers should prefer `myque edit`, `myque label`, `myque deps`, and `myque section` for task mutations. These commands preserve frontmatter/body structure, update `updated_at`, and run validation instead of relying on manual file edits.
+
 ## Lifecycle statuses
 
 | Status | Meaning |

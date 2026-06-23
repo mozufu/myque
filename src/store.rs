@@ -54,6 +54,68 @@ impl CreateTaskInput {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct UpdateTaskInput {
+    pub title: Option<String>,
+    pub priority: Option<i64>,
+    pub order: Option<i64>,
+    pub agent: Option<String>,
+    pub backend: Option<String>,
+    pub max_attempts: Option<u32>,
+    pub allowed_auto_dispatch: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionMode {
+    Replace,
+    Append,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskSectionName {
+    Goal,
+    Context,
+    Constraints,
+    Acceptance,
+    Files,
+    Notes,
+}
+
+impl TaskSectionName {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Goal => "Goal",
+            Self::Context => "Context",
+            Self::Constraints => "Constraints",
+            Self::Acceptance => "Acceptance",
+            Self::Files => "Files",
+            Self::Notes => "Notes",
+        }
+    }
+}
+
+impl std::str::FromStr for TaskSectionName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "goal" => Ok(Self::Goal),
+            "context" => Ok(Self::Context),
+            "constraints" => Ok(Self::Constraints),
+            "acceptance" => Ok(Self::Acceptance),
+            "files" => Ok(Self::Files),
+            "notes" => Ok(Self::Notes),
+            _ => Err(format!("unknown section `{value}`")),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SectionUpdateError {
+    #[error("missing section text; pass text or --stdin")]
+    EmptyInput,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskStore {
     root: PathBuf,
@@ -81,6 +143,8 @@ pub enum StoreError {
     },
     #[error("validation failed")]
     Validation(Vec<ValidationError>),
+    #[error(transparent)]
+    SectionUpdate(#[from] SectionUpdateError),
     #[error("task not found: {0}")]
     TaskNotFound(String),
     #[error("task id already exists: {0}")]
@@ -297,6 +361,183 @@ impl TaskStore {
         Ok(stored)
     }
 
+    pub fn update_task(&self, id: &str, input: UpdateTaskInput) -> StoreResult<StoredTask> {
+        let mut stored = self.get_task(id)?;
+        if let Some(title) = input.title {
+            stored.task.title = title.clone();
+            stored.frontmatter.title = Some(title);
+        }
+        if let Some(priority) = input.priority {
+            stored.task.priority = priority;
+            stored.frontmatter.priority = Some(priority);
+        }
+        if let Some(order) = input.order {
+            stored.task.order = order;
+            stored.frontmatter.order = Some(order);
+        }
+        if let Some(agent) = input.agent {
+            stored.task.agent = agent.clone();
+            stored.frontmatter.agent = Some(agent);
+        }
+        if let Some(backend) = input.backend {
+            stored.task.backend = backend.clone();
+            stored.frontmatter.backend = Some(backend);
+        }
+        if let Some(max_attempts) = input.max_attempts {
+            stored.task.max_attempts = max_attempts;
+            stored.frontmatter.max_attempts = Some(max_attempts);
+        }
+        if let Some(allowed_auto_dispatch) = input.allowed_auto_dispatch {
+            stored.task.allowed_auto_dispatch = allowed_auto_dispatch;
+            stored.frontmatter.allowed_auto_dispatch = Some(allowed_auto_dispatch);
+        }
+        self.write_validated_task(stored)
+    }
+
+    pub fn update_labels(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> StoreResult<StoredTask> {
+        let mut stored = self.get_task(id)?;
+        for label in add {
+            if !stored.task.labels.contains(label) {
+                stored.task.labels.push(label.clone());
+            }
+        }
+        stored.task.labels.retain(|label| !remove.contains(label));
+        stored.frontmatter.labels = Some(stored.task.labels.clone());
+        self.write_validated_task(stored)
+    }
+
+    pub fn update_dependencies(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+    ) -> StoreResult<StoredTask> {
+        let mut stored = self.get_task(id)?;
+        for dependency in add {
+            if !stored.task.depends_on.contains(dependency) {
+                stored.task.depends_on.push(dependency.clone());
+            }
+        }
+        stored
+            .task
+            .depends_on
+            .retain(|dependency| !remove.contains(dependency));
+        stored.frontmatter.depends_on = Some(stored.task.depends_on.clone());
+        self.write_validated_dependency_update(stored)
+    }
+
+    pub fn update_section(
+        &self,
+        id: &str,
+        section: TaskSectionName,
+        text: &str,
+        mode: SectionMode,
+    ) -> StoreResult<StoredTask> {
+        if text.is_empty() {
+            return Err(SectionUpdateError::EmptyInput.into());
+        }
+        let mut stored = self.get_task(id)?;
+        stored.body = update_section_body(&stored.body, section, text, mode);
+        self.write_validated_task(stored)
+    }
+
+    pub fn fail_task(&self, id: &str, reason: String) -> StoreResult<StoredTask> {
+        let mut stored = self.get_task(id)?;
+        let now = now_rfc3339();
+        stored.task.status = Status::Failed;
+        stored.task.failure_reason = Some(reason.clone());
+        stored.task.completed_at = Some(now.clone());
+        stored.task.updated_at = now.clone();
+        stored.frontmatter.status = Some(Status::Failed.to_string());
+        stored.frontmatter.failure_reason = Some(reason);
+        stored.frontmatter.completed_at = Some(now.clone());
+        stored.frontmatter.updated_at = Some(now);
+        self.write_validated_stored_task(&stored)?;
+        Ok(stored)
+    }
+
+    pub fn complete_task(&self, id: &str, done: bool, config: &Config) -> StoreResult<StoredTask> {
+        let status = if done {
+            if !config.policy.agents_may_mark_done {
+                return Err(StoreError::Validation(vec![ValidationError {
+                    code: validation::ErrorCode::TaskInvalidStatus,
+                    context: Some(id.to_owned()),
+                    message: "agents may not mark tasks done by policy".to_owned(),
+                }]));
+            }
+            Status::Done
+        } else {
+            Status::Review
+        };
+        let mut stored = self.get_task(id)?;
+        let now = now_rfc3339();
+        stored.task.status = status.clone();
+        stored.task.completed_at = Some(now.clone());
+        stored.task.updated_at = now.clone();
+        stored.frontmatter.status = Some(status.to_string());
+        stored.frontmatter.completed_at = Some(now.clone());
+        stored.frontmatter.updated_at = Some(now);
+        self.write_validated_stored_task(&stored)?;
+        Ok(stored)
+    }
+
+    fn write_validated_task(&self, mut stored: StoredTask) -> StoreResult<StoredTask> {
+        let now = now_rfc3339();
+        stored.task.updated_at = now.clone();
+        stored.frontmatter.updated_at = Some(now);
+        self.write_validated_stored_task(&stored)?;
+        self.load_task_file(&stored.path)
+    }
+
+    fn write_validated_dependency_update(&self, mut stored: StoredTask) -> StoreResult<StoredTask> {
+        let now = now_rfc3339();
+        stored.task.updated_at = now.clone();
+        stored.frontmatter.updated_at = Some(now);
+        self.validate_stored_task(&stored)?;
+        let mut tasks = self
+            .load_tasks()?
+            .into_iter()
+            .map(|candidate| {
+                if candidate.task.id == stored.task.id {
+                    stored.task.clone()
+                } else {
+                    candidate.task
+                }
+            })
+            .collect::<Vec<_>>();
+        if !tasks.iter().any(|task| task.id == stored.task.id) {
+            tasks.push(stored.task.clone());
+        }
+        let errors = validation::validate_dependencies(&tasks);
+        if !errors.is_empty() {
+            return Err(StoreError::Validation(errors));
+        }
+        self.write_validated_stored_task(&stored)?;
+        self.load_task_file(&stored.path)
+    }
+
+    fn write_validated_stored_task(&self, stored: &StoredTask) -> StoreResult<()> {
+        self.validate_stored_task(stored)?;
+        self.write_task(stored)
+    }
+
+    fn validate_stored_task(&self, stored: &StoredTask) -> StoreResult<()> {
+        let raw = write_task_file(&stored.frontmatter, &stored.body).map_err(|source| {
+            StoreError::Frontmatter {
+                path: stored.path.clone(),
+                source,
+            }
+        })?;
+        validation::validate_task_file(&raw, &stored.path.display().to_string())
+            .map(|_| ())
+            .map_err(StoreError::Validation)
+    }
+
     pub fn validate(&self, _config: &Config) -> StoreResult<Vec<ValidationError>> {
         let mut tasks = Vec::new();
         let mut errors = Vec::new();
@@ -493,6 +734,72 @@ fn generated_task_id(now: &str) -> String {
 
 fn default_task_body() -> String {
     "## Goal\n\n\n## Context\n\n\n## Constraints\n\n\n## Acceptance\n\n".to_owned()
+}
+
+fn update_section_body(
+    body: &str,
+    section: TaskSectionName,
+    text: &str,
+    mode: SectionMode,
+) -> String {
+    let heading = format!("## {}", section.title());
+    let lines = body.lines().collect::<Vec<_>>();
+    let start = lines
+        .iter()
+        .position(|line| line.trim().eq_ignore_ascii_case(&heading));
+    let normalized_text = text.trim_matches('\n');
+
+    match start {
+        Some(start) => {
+            let end = lines
+                .iter()
+                .enumerate()
+                .skip(start + 1)
+                .find_map(|(index, line)| line.trim_start().starts_with("## ").then_some(index))
+                .unwrap_or(lines.len());
+            let mut out = String::new();
+            for line in &lines[..=start] {
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+            if mode == SectionMode::Append {
+                for line in lines[start + 1..end]
+                    .iter()
+                    .skip_while(|line| line.trim().is_empty())
+                {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+                if !out.ends_with("\n\n") {
+                    out.push('\n');
+                }
+            }
+            if !normalized_text.is_empty() {
+                out.push_str(normalized_text);
+                out.push('\n');
+            }
+            if end < lines.len() {
+                out.push('\n');
+                for line in &lines[end..] {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        None => {
+            let mut out = body.trim_end_matches('\n').to_owned();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&heading);
+            out.push_str("\n\n");
+            out.push_str(normalized_text);
+            out.push('\n');
+            out
+        }
+    }
 }
 
 fn sanitize_file_stem(id: &str) -> String {

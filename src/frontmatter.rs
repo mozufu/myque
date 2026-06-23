@@ -78,7 +78,7 @@ pub fn parse_task_file(raw: &str) -> Result<(TaskFrontmatter, &str), Frontmatter
 pub fn write_task_file(fm: &TaskFrontmatter, body: &str) -> Result<String, FrontmatterError> {
     let toml_src =
         toml::to_string(fm).map_err(|e| FrontmatterError::SerializeError(e.to_string()))?;
-    Ok(format!("+++\n{toml_src}+++\n\n{body}"))
+    Ok(format!("+++\n{toml_src}+++\n{body}"))
 }
 
 // ---------------------------------------------------------------------------

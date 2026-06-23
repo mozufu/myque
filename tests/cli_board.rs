@@ -457,3 +457,262 @@ fn noop_dispatch_marks_running_and_writes_run_record() {
     assert!(run_record.contains("backend = \"noop\""));
     assert!(run_record.contains("status = \"started\""));
 }
+
+#[test]
+fn edit_updates_frontmatter_and_preserves_body() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(&store, "task-edit", "Edit", "backlog", &[], &[], false);
+    let before = store.get_task("task-edit").unwrap();
+
+    let output = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "edit",
+        "task-edit",
+        "--title",
+        "Edited title",
+        "--priority",
+        "5",
+        "--allow-auto",
+    ])
+    .unwrap();
+
+    assert_eq!(output, "Updated task-edit\n");
+    let after = store.get_task("task-edit").unwrap();
+    assert_eq!(after.task.title, "Edited title");
+    assert_eq!(after.task.priority, 5);
+    assert!(after.task.allowed_auto_dispatch);
+    assert_eq!(after.body, before.body);
+    assert_ne!(after.task.updated_at, before.task.updated_at);
+}
+
+#[test]
+fn label_add_remove_is_idempotent_and_dedupes() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(
+        &store,
+        "task-label",
+        "Label",
+        "backlog",
+        &["old", "safe-auto"],
+        &[],
+        false,
+    );
+
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "label",
+        "task-label",
+        "--add",
+        "safe-auto",
+        "--add",
+        "cli",
+        "--remove",
+        "old",
+    ])
+    .unwrap();
+
+    let after = store.get_task("task-label").unwrap();
+    assert_eq!(after.task.labels, vec!["safe-auto", "cli"]);
+}
+
+#[test]
+fn deps_rejects_unknown_self_and_cycle() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(&store, "task-a", "A", "backlog", &[], &[], false);
+    write_task(&store, "task-b", "B", "backlog", &[], &["task-a"], false);
+
+    let unknown = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "deps",
+        "task-a",
+        "--add",
+        "missing",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(unknown.contains("validation failed"));
+    assert_eq!(
+        store.get_task("task-a").unwrap().task.depends_on,
+        Vec::<String>::new()
+    );
+
+    let self_dep = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "deps",
+        "task-a",
+        "--add",
+        "task-a",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(self_dep.contains("validation failed"));
+    assert_eq!(
+        store.get_task("task-a").unwrap().task.depends_on,
+        Vec::<String>::new()
+    );
+
+    let cycle = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "deps",
+        "task-a",
+        "--add",
+        "task-b",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(cycle.contains("validation failed"));
+    assert_eq!(
+        store.get_task("task-a").unwrap().task.depends_on,
+        Vec::<String>::new()
+    );
+}
+
+#[test]
+fn section_replaces_only_target_section_and_appends_optional_section() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(
+        &store,
+        "task-section",
+        "Section",
+        "backlog",
+        &[],
+        &[],
+        false,
+    );
+
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "section",
+        "task-section",
+        "acceptance",
+        "- New acceptance",
+    ])
+    .unwrap();
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "section",
+        "task-section",
+        "files",
+        "- `src/cli.rs`",
+        "--append",
+    ])
+    .unwrap();
+
+    let after = store.get_task("task-section").unwrap();
+    assert!(after.body.contains("## Goal\n\nFinish Section."));
+    assert!(after.body.contains("## Acceptance\n\n- New acceptance"));
+    assert!(after.body.contains("## Files\n\n- `src/cli.rs`"));
+    assert!(!after.body.contains("- Observable result exists."));
+}
+
+#[test]
+fn fail_and_complete_update_status_metadata_and_preserve_body() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(&store, "task-fail", "Fail", "running", &[], &[], false);
+    write_task(
+        &store,
+        "task-complete",
+        "Complete",
+        "running",
+        &[],
+        &[],
+        false,
+    );
+    let before_fail = store.get_task("task-fail").unwrap();
+    let before_complete = store.get_task("task-complete").unwrap();
+
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "fail",
+        "task-fail",
+        "--reason",
+        "test failure",
+    ])
+    .unwrap();
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "complete",
+        "task-complete",
+    ])
+    .unwrap();
+
+    let failed = store.get_task("task-fail").unwrap();
+    assert_eq!(failed.task.status, Status::Failed);
+    assert_eq!(failed.task.failure_reason.as_deref(), Some("test failure"));
+    assert!(failed.task.completed_at.is_some());
+    assert_eq!(failed.body, before_fail.body);
+
+    let completed = store.get_task("task-complete").unwrap();
+    assert_eq!(completed.task.status, Status::Review);
+    assert!(completed.task.completed_at.is_some());
+    assert_eq!(completed.body, before_complete.body);
+}
+
+#[test]
+fn complete_done_rejected_unless_policy_allows_agents_may_mark_done() {
+    let tmp = TempDir::new().unwrap();
+    let store = TaskStore::new(tmp.path());
+    store.init(false).unwrap();
+    write_task(&store, "task-done", "Done", "running", &[], &[], false);
+
+    let rejected = run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "complete",
+        "task-done",
+        "--done",
+    ])
+    .unwrap_err()
+    .to_string();
+    assert!(rejected.contains("validation failed"));
+    assert_eq!(
+        store.get_task("task-done").unwrap().task.status,
+        Status::Running
+    );
+
+    let mut config = Config::default();
+    config.policy.agents_may_mark_done = true;
+    store.write_config(&config).unwrap();
+    run_with_args([
+        "myque",
+        "--root",
+        tmp.path().to_str().unwrap(),
+        "complete",
+        "task-done",
+        "--done",
+    ])
+    .unwrap();
+    assert_eq!(
+        store.get_task("task-done").unwrap().task.status,
+        Status::Done
+    );
+}

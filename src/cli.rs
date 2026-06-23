@@ -4,11 +4,14 @@ use crate::eligibility::{
     DispatchPlan, EligibilityDecision, SkipReason, plan_dispatch_for_tasks, skip_reason_text,
 };
 use crate::model::{Config, Status, Task};
-use crate::store::{CreateTaskInput, StoredTask, TaskStore};
+use crate::store::{
+    CreateTaskInput, SectionMode, StoredTask, TaskSectionName, TaskStore, UpdateTaskInput,
+};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
@@ -81,6 +84,65 @@ pub enum Command {
         task_id: String,
         #[arg(value_parser = parse_status)]
         status: Status,
+    },
+    /// Patch task frontmatter while preserving Markdown body.
+    Edit {
+        task_id: String,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        priority: Option<i64>,
+        #[arg(long)]
+        order: Option<i64>,
+        #[arg(long)]
+        agent: Option<String>,
+        #[arg(long)]
+        backend: Option<String>,
+        #[arg(long)]
+        max_attempts: Option<u32>,
+        #[arg(long = "allow-auto")]
+        allow_auto: bool,
+        #[arg(long = "no-allow-auto")]
+        no_allow_auto: bool,
+    },
+    /// Add or remove labels idempotently.
+    Label {
+        task_id: String,
+        #[arg(long = "add")]
+        add: Vec<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Add or remove dependencies idempotently.
+    Deps {
+        task_id: String,
+        #[arg(long = "add")]
+        add: Vec<String>,
+        #[arg(long = "remove")]
+        remove: Vec<String>,
+    },
+    /// Replace or append one Markdown section.
+    Section {
+        task_id: String,
+        section: TaskSectionName,
+        #[arg(allow_hyphen_values = true)]
+        text: Option<String>,
+        #[arg(long)]
+        append: bool,
+        #[arg(long)]
+        stdin: bool,
+    },
+    /// Mark a task failed with a reason.
+    Fail {
+        task_id: String,
+        #[arg(long)]
+        reason: String,
+    },
+    /// Mark a task complete for review, or done when policy allows it.
+    Complete {
+        task_id: String,
+        #[arg(long)]
+        done: bool,
     },
     /// Validate all task files and config.
     Validate,
@@ -183,6 +245,93 @@ pub fn execute(cli: Cli) -> Result<String> {
             let stored = store.update_status(&task_id, status)?;
             Ok(format!(
                 "Moved {} to {}\n",
+                stored.task.id, stored.task.status
+            ))
+        }
+        Command::Edit {
+            task_id,
+            title,
+            priority,
+            order,
+            agent,
+            backend,
+            max_attempts,
+            allow_auto,
+            no_allow_auto,
+        } => {
+            let allowed_auto_dispatch = match (allow_auto, no_allow_auto) {
+                (true, false) => Some(true),
+                (false, true) => Some(false),
+                _ => None,
+            };
+            let input = UpdateTaskInput {
+                title,
+                priority,
+                order,
+                agent,
+                backend,
+                max_attempts,
+                allowed_auto_dispatch,
+            };
+            let stored = store.update_task(&task_id, input)?;
+            Ok(format!("Updated {}\n", stored.task.id))
+        }
+        Command::Label {
+            task_id,
+            add,
+            remove,
+        } => {
+            let stored = store.update_labels(&task_id, &add, &remove)?;
+            Ok(format!(
+                "Updated labels for {}: {}\n",
+                stored.task.id,
+                join_or_dash(&stored.task.labels)
+            ))
+        }
+        Command::Deps {
+            task_id,
+            add,
+            remove,
+        } => {
+            let stored = store.update_dependencies(&task_id, &add, &remove)?;
+            Ok(format!(
+                "Updated dependencies for {}: {}\n",
+                stored.task.id,
+                join_or_dash(&stored.task.depends_on)
+            ))
+        }
+        Command::Section {
+            task_id,
+            section,
+            text,
+            append,
+            stdin,
+        } => {
+            let mut input = text.unwrap_or_default();
+            if stdin {
+                std::io::stdin().read_to_string(&mut input)?;
+            }
+            let mode = if append {
+                SectionMode::Append
+            } else {
+                SectionMode::Replace
+            };
+            let stored = store.update_section(&task_id, section, &input, mode)?;
+            Ok(format!(
+                "Updated {} for {}\n",
+                section.title(),
+                stored.task.id
+            ))
+        }
+        Command::Fail { task_id, reason } => {
+            let stored = store.fail_task(&task_id, reason)?;
+            Ok(format!("Failed {}\n", stored.task.id))
+        }
+        Command::Complete { task_id, done } => {
+            let config = store.load_config()?;
+            let stored = store.complete_task(&task_id, done, &config)?;
+            Ok(format!(
+                "Completed {} to {}\n",
                 stored.task.id, stored.task.status
             ))
         }

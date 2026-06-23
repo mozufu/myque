@@ -76,6 +76,16 @@ myque move task-2026-06-22-001 ready
 myque move task-2026-06-22-001 review
 ```
 
+Patch task details without opening the Markdown file:
+
+```sh
+myque edit task-2026-06-22-001 --priority 1 --allow-auto
+myque label task-2026-06-22-001 --add safe-auto
+myque deps task-2026-06-22-001 --add task-2026-06-22-000
+myque section task-2026-06-22-001 acceptance --append "- CLI mutation path is tested."
+myque complete task-2026-06-22-001
+```
+
 Validate all task files and config:
 
 ```sh
