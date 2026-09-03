@@ -1,26 +1,112 @@
 # myque
 
-An amortized O(1) purely functional FIFO queue for Haskell, packaged as a Nix
-flake.
+A local-first, Git-native work item tracker for tasks, issues, bugs,
+milestones, epics, and follow-up work, implementing
+[`docs/spec.md`](docs/spec.md) (`work-item/v1`). Packaged as a Nix flake.
 
-`Myque.Queue` is a banker's queue: two lists, `front` in dequeue order and
-`back` in reverse enqueue order. `push` conses onto `back`, `pop` unconses
-`front`, and `front` is refilled with `reverse back` when it runs dry. The
-representation maintains the invariant
+Canonical state is one Markdown file per item under `.tasks/items/`, named
+after the item's identity. There is no server, database, account, or central
+ID allocator: identity is a UUIDv7 allocated locally, so two Git branches can
+each create items with no shared registry, sequence counter, or
+ID-allocation race. Human keys such as `C9.4` are presentation aliases —
+relationships always persist UUIDs, so renaming a key rewrites nothing else.
 
+```console
+$ myque init
+initialised tracker in /repo/.tasks
+
+$ myque new "Userspace lifecycle supervision" --kind milestone --key C9.4 --tag runtime
+created C9.4
+019a10d8-8d48-7b77-a414-f95ab7af31be
+.tasks/items/019a10d8-8d48-7b77-a414-f95ab7af31be.md
+
+$ myque depend C9.4 C9.4.1     # accepts keys, writes UUIDs
+$ myque next                   # open, with every dependency done
+KEY     KIND  STATE         TITLE
+C9.4.1  task  open (ready)  Restart policy engine
+
+$ myque check                  # non-zero exit on any finding
+checked 4 work item(s): no findings
 ```
-null front  ==>  null back
+
+A canonical item file:
+
+```markdown
+---
+schema: work-item/v1
+id: 019a10d8-8d48-7b77-a414-f95ab7af31be
+key: C9.4
+kind: milestone
+state: done
+created: 2026-08-20T14:21:00+08:00
+closed: 2026-08-26T19:42:00+08:00
+tags:
+  - runtime
+  - lifecycle
+depends:
+  - 019a018c-a43e-7cd8-903d-a45e77d78865
+---
+
+# Userspace lifecycle supervision
+
+## Exit conditions
+
+- A supervisor can restart a failed component.
 ```
 
-so `null`, `peek`, and `size` are O(1), and every element is reversed at most
-once, making `push` and `pop` amortized O(1).
+## Commands
+
+| Group | Commands |
+| --- | --- |
+| Storage | `init`, `check` |
+| Items | `new`, `show`, `list`, `next`, `query`, `rm` |
+| State | `start`, `close`, `cancel`, `reopen`, `defer`, `block` |
+| Metadata | `key`, `title`, `tag`, `untag` |
+| Relationships | `depend`, `undepend`, `parent`, `relate`, `unrelate`, `duplicate`, `supersede` |
+| Views | `graph` (Mermaid), `render` (Markdown) |
+
+An item is referenced by canonical UUID or by human key; a well-formed UUID
+always wins. `list` filters on `--state`, `--kind`, `--tag`, `--parent`, and
+`--ready`; `query` takes an expression such as
+`'tag = "runtime" and state != done'`. Run `myque help` for the full listing.
+
+An item is **ready** when it is `open` and every dependency is `done`.
+`blocks` is normalised into the dependency relation, so either side of an
+edge may declare it.
+
+`check` validates identity (UUID form, UUIDv7, duplicates, filename/ID
+mismatch), alias uniqueness, dangling references, parent and dependency
+cycles, state/`closed` consistency, and schema conformance. The frontmatter
+schema is closed, so an unknown field is an error rather than a warning.
+Findings exit non-zero.
+
+Generated views are never authoritative: deleting them loses nothing, and
+they can always be rebuilt from the Markdown files.
+
+## Modules
+
+| Module | Responsibility |
+| --- | --- |
+| `Myque.Uuid` | UUIDv7 allocation and parsing (RFC 9562 §5.7) |
+| `Myque.Timestamp` | ISO 8601 timestamps; an explicit UTC offset is mandatory |
+| `Myque.Frontmatter` | The closed YAML subset the schema uses; verbatim body preservation |
+| `Myque.Item` | The `work-item/v1` model and its Markdown encoding |
+| `Myque.Store` | Canonical file storage, configuration, and selector resolution |
+| `Myque.Graph` | Parent and dependency edges, cycle detection, readiness |
+| `Myque.Validate` | Repository validation findings |
+| `Myque.Query` | The filter expression language |
+| `Myque.Render` | Tables, detail views, Mermaid, Markdown summaries |
+| `Myque.Cli` | Argument parsing and command execution |
+
+The package depends only on GHC boot libraries: the frontmatter subset,
+UUIDv7 allocation, and query language are implemented in-tree.
 
 ## Flake outputs
 
 | Output | Description |
 | --- | --- |
 | `packages.default` / `packages.myque` | Library, executable, and Haddock; the cabal test-suite runs during the build |
-| `packages.myque-bin` | `justStaticExecutables` — the `myque` binary without the GHC closure (55 MB vs 3.5 GB) |
+| `packages.myque-bin` | `justStaticExecutables` — the `myque` binary without the GHC closure |
 | `packages.myque-docs` | Haddock output only |
 | `packages.myque-checked` | Explicitly `doCheck` + `doHaddock`, as a CI target |
 | `packages.ghc` | The GHC the package is built with |
@@ -35,8 +121,8 @@ once, making `push` and `pop` amortized O(1).
 ## Usage
 
 ```bash
-nix build            # build the package and run its tests
-nix run . -- a b c   # enqueue arguments, then drain the queue
+nix build            # build the package and run its test-suite
+nix run . -- list    # run the tracker
 nix flake check      # package build + HLint + formatting
 nix develop          # enter the dev shell
 direnv allow         # or auto-enter the shell on cd
@@ -47,7 +133,7 @@ Inside the dev shell, the usual cabal workflow applies:
 ```bash
 cabal build all
 cabal test
-cabal run myque -- alpha beta
+cabal run myque -- check
 cabal haddock
 ```
 
@@ -75,29 +161,6 @@ cabal2nix ./. > myque.nix   # then restore the `src` argument, see the file head
 The flake filters its own source tree (`lib.cleanSourceWith`), so editing
 `flake.nix`, `flake.lock`, `.envrc`, or `.gitignore` does not invalidate the
 package derivation.
-
-## API
-
-```haskell
-empty      :: Queue a
-singleton  :: a -> Queue a
-fromList   :: [a] -> Queue a
-push       :: a -> Queue a -> Queue a
-pop        :: Queue a -> Maybe (a, Queue a)
-peek       :: Queue a -> Maybe a
-null       :: Queue a -> Bool
-size       :: Queue a -> Int
-toList     :: Queue a -> [a]
-```
-
-`Queue` instantiates `Foldable`, `Functor`, `Traversable`, `Semigroup`,
-`Monoid`, `Eq`, `Ord`, and `Show`. `Eq`/`Ord` compare the logical element
-sequence, so the internal front/back split is not observable:
-
-```haskell
->>> foldl (flip push) empty [1, 2, 3] == fromList [1, 2, 3]
-True
-```
 
 ## License
 
