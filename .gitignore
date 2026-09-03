@@ -1,0 +1,13 @@
+# Haskell
+dist-newstyle/
+dist/
+*.hi
+*.o
+.ghc.environment.*
+cabal.project.local
+.hie/
+
+# Nix / direnv
+result
+result-*
+.direnv/
