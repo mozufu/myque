@@ -7,7 +7,13 @@
   lib,
   src,
   base,
+  bytestring,
+  containers,
+  directory,
+  filepath,
   hspec,
+  text,
+  time,
 }:
 mkDerivation {
   pname = "myque";
@@ -15,13 +21,24 @@ mkDerivation {
   inherit src;
   isLibrary = true;
   isExecutable = true;
-  libraryHaskellDepends = [ base ];
+  libraryHaskellDepends = [
+    base
+    bytestring
+    containers
+    directory
+    filepath
+    text
+    time
+  ];
   executableHaskellDepends = [ base ];
   testHaskellDepends = [
     base
+    directory
+    filepath
     hspec
+    text
   ];
-  description = "An amortized O(1) purely functional FIFO queue";
+  description = "A local-first, Git-native work item tracker";
   license = lib.licenses.bsd3;
   mainProgram = "myque";
 }

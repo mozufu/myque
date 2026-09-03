@@ -1,5 +1,5 @@
 {
-  description = "myque - an amortized O(1) purely functional FIFO queue";
+  description = "myque - a local-first, Git-native work item tracker";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

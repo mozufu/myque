@@ -1,19 +1,24 @@
 cabal-version:   3.0
 name:            myque
 version:         0.1.0.0
-synopsis:        An amortized O(1) purely functional FIFO queue
+synopsis:        A local-first, Git-native work item tracker
 description:
-  A banker's queue: two lists, front and back. Pushes cons onto the back,
-  pops uncons the front, and the front is refilled by reversing the back
-  when it runs dry. Each element is moved at most once, so push and pop are
-  amortized O(1).
+  @Myque.*@ and the @myque@ executable implement the
+  @work-item\/v1@ specification in @docs\/spec.md@: a local-first,
+  Git-native issue and task tracker whose canonical state is one Markdown
+  file per work item, identified by a locally allocated UUIDv7.
+  .
+  Canonical state is plain Markdown with frontmatter, so tracker data
+  diffs, merges, and branches like any other file in the repository. New
+  identities are UUIDv7 values allocated locally, which means concurrent
+  branches never race over an identifier.
 
 license:         BSD-3-Clause
 license-file:    LICENSE
 author:          Brian Duan
 maintainer:      iceice666@outlook.com
 copyright:       (c) 2026 Brian Duan
-category:        Data Structures
+category:        Development
 build-type:      Simple
 extra-doc-files: README.md
 
@@ -24,10 +29,28 @@ common warnings
 
 library
   import:           warnings
-  exposed-modules:  Myque.Queue
+  exposed-modules:
+    Myque.Cli
+    Myque.Frontmatter
+    Myque.Graph
+    Myque.Item
+    Myque.Query
+    Myque.Render
+    Myque.Store
+    Myque.Timestamp
+    Myque.Uuid
+    Myque.Validate
+
   hs-source-dirs:   src
   default-language: GHC2021
-  build-depends:    base >=4.18 && <5
+  build-depends:
+    , base        >=4.18 && <5
+    , bytestring  >=0.11 && <0.13
+    , containers  >=0.6  && <0.9
+    , directory   >=1.3  && <1.4
+    , filepath    >=1.4  && <1.6
+    , text        >=2.0  && <2.2
+    , time        >=1.12 && <1.15
 
 executable myque
   import:           warnings
@@ -45,6 +68,9 @@ test-suite myque-test
   hs-source-dirs:   test
   default-language: GHC2021
   build-depends:
-    , base   >=4.18 && <5
-    , hspec  >=2.11 && <2.12
+    , base       >=4.18 && <5
+    , directory  >=1.3  && <1.4
+    , filepath   >=1.4  && <1.6
+    , hspec      >=2.11 && <2.12
     , myque
+    , text       >=2.0  && <2.2
