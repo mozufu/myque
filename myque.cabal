@@ -1,0 +1,50 @@
+cabal-version:   3.0
+name:            myque
+version:         0.1.0.0
+synopsis:        An amortized O(1) purely functional FIFO queue
+description:
+  A banker's queue: two lists, front and back. Pushes cons onto the back,
+  pops uncons the front, and the front is refilled by reversing the back
+  when it runs dry. Each element is moved at most once, so push and pop are
+  amortized O(1).
+
+license:         BSD-3-Clause
+license-file:    LICENSE
+author:          Brian Duan
+maintainer:      iceice666@outlook.com
+copyright:       (c) 2026 Brian Duan
+category:        Data Structures
+build-type:      Simple
+extra-doc-files: README.md
+
+common warnings
+  ghc-options:
+    -Wall -Wcompat -Wincomplete-record-updates
+    -Wincomplete-uni-patterns -Wredundant-constraints
+
+library
+  import:           warnings
+  exposed-modules:  Myque.Queue
+  hs-source-dirs:   src
+  default-language: GHC2021
+  build-depends:    base >=4.18 && <5
+
+executable myque
+  import:           warnings
+  main-is:          Main.hs
+  hs-source-dirs:   app
+  default-language: GHC2021
+  build-depends:
+    , base   >=4.18 && <5
+    , myque
+
+test-suite myque-test
+  import:           warnings
+  type:             exitcode-stdio-1.0
+  main-is:          Spec.hs
+  hs-source-dirs:   test
+  default-language: GHC2021
+  build-depends:
+    , base   >=4.18 && <5
+    , hspec  >=2.11 && <2.12
+    , myque
