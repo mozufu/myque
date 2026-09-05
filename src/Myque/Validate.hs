@@ -23,7 +23,7 @@ import Data.Map.Strict qualified as Map
 import Data.Maybe (maybeToList)
 import Data.Text (Text)
 import Data.Text qualified as T
-import Myque.Graph (dependencyCycles, parentCycles)
+import Myque.Graph (Cycle (..), dependencyCycles, parentCycles)
 import Myque.Item (State (..), WorkItem (..))
 import Myque.Store (LoadError (..), Store (..), storeItems)
 import Myque.Uuid (Uuid, uuidText)
@@ -49,9 +49,9 @@ data Finding
   | -- | An item depends on itself.
     SelfDependency Uuid
   | -- | The parent relation contains a cycle.
-    ParentCycle [Uuid]
+    ParentCycle Cycle
   | -- | The dependency relation contains a cycle.
-    DependencyCycle [Uuid]
+    DependencyCycle Cycle
   | {- | An item declares itself a duplicate of an active item while staying
     active itself.
     -}
@@ -72,10 +72,28 @@ findingText f = case f of
   DanglingReference from fld to -> uuidText from <> ": dangling " <> fld <> " reference to " <> uuidText to
   SelfParent uuid -> uuidText uuid <> ": item is its own parent"
   SelfDependency uuid -> uuidText uuid <> ": item depends on itself"
-  ParentCycle members -> "parent cycle: " <> T.intercalate " -> " (map uuidText members)
-  DependencyCycle members -> "dependency cycle: " <> T.intercalate " -> " (map uuidText members)
+  ParentCycle c -> "parent cycle: " <> cycleDescription c
+  DependencyCycle c -> "dependency cycle: " <> cycleDescription c
   DuplicateStillActive uuid -> uuidText uuid <> ": declares duplicate_of but is not in a closed state"
   TimestampOutOfOrder uuid fld -> uuidText uuid <> ": " <> fld <> " precedes created"
+
+{- | Describe a cycle in bounded space: the witness path, the edge that
+closes it, and the cycle's real length when the witness is truncated.
+-}
+cycleDescription :: Cycle -> Text
+cycleDescription c =
+  T.intercalate " -> " (map uuidText (cycleWitness c))
+    <> ellipsis
+    <> ", closed by "
+    <> uuidText from
+    <> " -> "
+    <> uuidText to
+    <> " ("
+    <> T.pack (show (cycleLength c))
+    <> " items)"
+ where
+  (from, to) = cycleClosing c
+  ellipsis = if cycleLength c > length (cycleWitness c) then " -> ..." else ""
 
 -- | Every finding in a loaded store, in a stable order.
 validate :: Store -> [Finding]

@@ -24,6 +24,7 @@ module Myque.Item
   , Key
   , keyText
   , parseKey
+  , parseTag
   , WorkItem (..)
   , newWorkItem
   , itemTitle
@@ -148,6 +149,16 @@ parseKey raw
   | otherwise = Right (Key trimmed)
  where
   trimmed = T.strip raw
+
+{- | Parse a tag. Tags are single-token classifiers, so one rule governs
+every way a tag enters the tracker: decoding a canonical file and writing
+one from the CLI.
+-}
+parseTag :: Text -> Either String Text
+parseTag raw
+  | T.null (T.strip raw) = Left "tag must not be empty"
+  | T.any isSpace raw = Left ("tag must not contain whitespace: " <> T.unpack raw)
+  | otherwise = Right raw
 
 -- | A work item: the closed frontmatter schema plus a verbatim body.
 data WorkItem = WorkItem
@@ -333,16 +344,11 @@ optional name fm parse = case lookupNode name fm of
 uuidList :: Text -> Frontmatter -> Either String [Uuid]
 uuidList name fm = fmap nub (sequenceField name fm >>= traverse (field name . parseUuid))
 
--- | The @tags@ field: a sequence of non-empty strings, deduplicated.
+-- | The @tags@ field: a sequence of single-token strings, deduplicated.
 tagList :: Frontmatter -> Either String [Text]
 tagList fm = do
   raw <- sequenceField "tags" fm
-  traverse validate (nub raw)
- where
-  validate t
-    | T.null (T.strip t) = Left "field 'tags': tag must not be empty"
-    | T.any isSpace t = Left ("field 'tags': tag must not contain whitespace: " <> T.unpack t)
-    | otherwise = Right t
+  traverse (field "tags" . parseTag) (nub raw)
 
 {- | An optional sequence field. A scalar is rejected rather than coerced, so
 @depends: 019a...@ is an error instead of a silent single-element list.

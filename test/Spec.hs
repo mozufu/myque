@@ -1,3 +1,4 @@
+{-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE OverloadedStrings #-}
 
 {- | Behavioural tests for the work-item tracker.
@@ -17,24 +18,32 @@ module Main (main) where
 import Control.Exception (bracket)
 import Control.Monad (forM, forM_)
 import Data.Either (isLeft)
-import Data.List (isInfixOf, sort)
+import Data.List (isInfixOf, isSuffixOf, sort)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
 import Myque.Cli
   ( Command (..)
   , Effect (..)
+  , Failure (..)
   , Filters (..)
+  , Format (..)
   , Transition (..)
+  , commandUsage
   , emptyFilters
+  , failureStatus
   , parseCommand
+  , parseFormat
   , plan
+  , runCommand
   , transitionState
   )
 import Myque.Frontmatter qualified as FM
 import Myque.Graph
-  ( blockedBy
+  ( Cycle (..)
+  , blockedBy
   , childrenOf
+  , cycleWitnessLimit
   , dependenciesOf
   , dependencyCycles
   , edgesOf
@@ -55,11 +64,12 @@ import Myque.Item
   , parseKey
   , parseKind
   , parseState
+  , parseTag
   , setTitle
   , stateText
   )
 import Myque.Query (parseQuery, runQuery)
-import Myque.Render (label, mermaidGraph)
+import Myque.Render (idLines, jsonLines, label, mermaidGraph)
 import Myque.Store
   ( Config (..)
   , Layout (..)
@@ -68,6 +78,7 @@ import Myque.Store
   , defaultConfig
   , discoverLayout
   , initLayout
+  , invalidFiles
   , itemPath
   , loadStore
   , parseConfig
@@ -78,8 +89,15 @@ import Myque.Store
   )
 import Myque.Timestamp (Timestamp, parseTimestamp, timestampText)
 import Myque.Uuid (Uuid, isUuidV7, newUuidV7, parseUuid, uuidText, uuidVersion)
-import Myque.Validate (Finding (..), validate)
-import System.Directory (createDirectory, createDirectoryIfMissing, getTemporaryDirectory, removeDirectoryRecursive, removeFile)
+import Myque.Validate (Finding (..), findingText, validate)
+import System.Directory
+  ( createDirectory
+  , createDirectoryIfMissing
+  , getTemporaryDirectory
+  , removeDirectoryRecursive
+  , removeFile
+  , withCurrentDirectory
+  )
 import System.FilePath ((</>))
 import Test.Hspec hiding (Selector)
 
@@ -145,18 +163,29 @@ The action receives the loaded store, so items must be written before it
 runs.
 -}
 withRepo :: [WorkItem] -> (Store -> IO a) -> IO a
-withRepo items action = bracket create removeDirectoryRecursive $ \root -> do
+withRepo items action = withScratch "tracker" $ \root -> do
   layout <- initLayout root
   forM_ items (saveItem layout)
   store <- loadStore layout
   action store
+
+{- | Run an action in a directory with no tracker in it or in any parent,
+for the \"no tracker found\" path.
+-}
+withBareDirectory :: (FilePath -> IO a) -> IO a
+withBareDirectory = withScratch "bare"
+
+{- | A fresh temporary directory per case, removed afterwards.
+'createDirectory' fails rather than reusing one, so concurrent cases cannot
+share state.
+-}
+withScratch :: String -> (FilePath -> IO a) -> IO a
+withScratch name = bracket create removeDirectoryRecursive
  where
-  -- A fresh directory per repository: createDirectory fails rather than
-  -- reusing one, so concurrent test cases cannot share state.
   create = do
     tmp <- getTemporaryDirectory
     unique <- newUuidV7
-    let path = tmp </> ("myque-tracker-" <> T.unpack (uuidText unique))
+    let path = tmp </> ("myque-" <> name <> "-" <> T.unpack (uuidText unique))
     createDirectory path
     pure path
 
@@ -295,6 +324,72 @@ main = hspec $ do
       parseSelector idA `shouldBe` Right (ById (uid idA))
       fmap describeSelector (parseSelector "C9.4") `shouldBe` Right "key:C9.4"
 
+  describe "selectors" $ do
+    it "accepts the abbreviation the tables print" $
+      -- list renders a keyless item as the first UUID group, so show must
+      -- consume exactly what was displayed.
+      withRepo [item idA "A"] $ \store -> do
+        sel <- either fail pure (parseSelector (label (item idA "A")))
+        fmap (uuidText . itemId) (resolveSelector store sel) `shouldBe` Right idA
+
+    it "reads an abbreviation as an id, never as a key" $ do
+      parseSelector "019a10d8" `shouldBe` Right (ByPrefix "019a10d8")
+      parseSelector "019a10d8-8d48" `shouldBe` Right (ByPrefix "019a10d8-8d48")
+      parseSelector "C9.4" `shouldSatisfy` (/= Right (ByPrefix "C9.4"))
+
+    it "matches an abbreviation case-insensitively, as UUID parsing does" $
+      withRepo [item idA "A"] $ \store -> do
+        sel <- either fail pure (parseSelector "019A10D8")
+        fmap (uuidText . itemId) (resolveSelector store sel) `shouldBe` Right idA
+
+    it "prefers an id abbreviation over a key that spells the same text" $
+      -- Specification §17.2: id resolution takes precedence, so a key that
+      -- happens to look like an abbreviation must not shadow the item.
+      withRepo [item idA "A", keyed idB "019a10d8"] $ \store -> do
+        sel <- either fail pure (parseSelector "019a10d8")
+        fmap (uuidText . itemId) (resolveSelector store sel) `shouldBe` Right idA
+
+    it "falls back to a key when no id has that prefix" $
+      withRepo [item idA "A", keyed idB "abcdef"] $ \store -> do
+        sel <- either fail pure (parseSelector "abcdef")
+        fmap (uuidText . itemId) (resolveSelector store sel) `shouldBe` Right idB
+
+    it "keeps a hex-shaped key's case when falling back to it" $
+      -- 'D1' is a valid abbreviation shape, so the id attempt must not fold
+      -- the text before the key lookup or the key becomes unaddressable.
+      withRepo [keyed idA "D1", keyed idB "IO4"] $ \store -> do
+        d1 <- either fail pure (parseSelector "D1")
+        io4 <- either fail pure (parseSelector "IO4")
+        fmap (uuidText . itemId) (resolveSelector store d1) `shouldBe` Right idA
+        fmap (uuidText . itemId) (resolveSelector store io4) `shouldBe` Right idB
+
+    it "fails closed on an ambiguous abbreviation, naming every candidate" $ do
+      let twin = "019a10d8-0000-7000-8000-000000000000"
+      withRepo [item idA "A", item twin "twin"] $ \store -> do
+        sel <- either fail pure (parseSelector "019a10d8")
+        resolveSelector store sel `shouldSatisfy` failsWith "ambiguous"
+        resolveSelector store sel `shouldSatisfy` failsWith (T.unpack idA)
+        resolveSelector store sel `shouldSatisfy` failsWith (T.unpack twin)
+
+    it "reports an unmatched abbreviation as absent" $
+      withRepo [item idA "A"] $ \store -> do
+        sel <- either fail pure (parseSelector "deadbeef")
+        resolveSelector store sel `shouldSatisfy` failsWith "no work item with an id starting deadbeef"
+
+    it "says an item exists but is invalid instead of saying it is absent" $
+      -- loadStore drops a malformed item from the index, which is right for
+      -- check but would otherwise make every mutating command claim the one
+      -- file that needs fixing does not exist.
+      withRepo [item idB "B"] $ \store -> do
+        let layout = storeLayout store
+        TIO.writeFile (itemPath layout (uid idA)) (T.replace "tags:\n" "tags:\n  - two words\n" (encodeItem ((item idA "A") {itemTags = ["ok"]})))
+        reloaded <- loadStore layout
+        map fst (invalidFiles reloaded) `shouldBe` [uid idA]
+        resolveSelector reloaded (ById (uid idA)) `shouldSatisfy` failsWith "exists but is invalid"
+        resolveSelector reloaded (ById (uid idA)) `shouldSatisfy` failsWith "two words"
+        prefix <- either fail pure (parseSelector "019a10d8")
+        resolveSelector reloaded prefix `shouldSatisfy` failsWith "exists but is invalid"
+
   describe "titles" $ do
     it "reads the title from the first level-1 heading" $
       itemTitle (item idA "Ethernet framing") `shouldBe` "Ethernet framing"
@@ -398,16 +493,43 @@ main = hspec $ do
 
     it "detects a self-parent as a cycle and a finding" $
       withRepo [(item idA "A") {itemParent = Just (uid idA)}] $ \store -> do
-        parentCycles store `shouldBe` [[uid idA]]
-        validate store `shouldSatisfy` elem (SelfParent (uid idA))
+        map cycleWitness (parentCycles store) `shouldBe` [[uid idA]]
+        map cycleClosing (parentCycles store) `shouldBe` [(uid idA, uid idA)]
+        validate store `shouldSatisfy` any isParentCycle
 
     it "detects a two-item parent cycle" $
       withRepo [(item idA "A") {itemParent = Just (uid idB)}, (item idB "B") {itemParent = Just (uid idA)}] $ \store ->
-        parentCycles store `shouldBe` [sort [uid idA, uid idB]]
+        map (sort . cycleWitness) (parentCycles store) `shouldBe` [sort [uid idA, uid idB]]
 
     it "detects a three-item dependency cycle" $
-      withRepo [dependsOn idA [idB], dependsOn idB [idC], dependsOn idC [idA]] $ \store ->
-        dependencyCycles store `shouldBe` [sort [uid idA, uid idB, uid idC]]
+      withRepo [dependsOn idA [idB], dependsOn idB [idC], dependsOn idC [idA]] $ \store -> do
+        map (sort . cycleWitness) (dependencyCycles store) `shouldBe` [sort [uid idA, uid idB, uid idC]]
+        map cycleLength (dependencyCycles store) `shouldBe` [3]
+
+    it "names the closing edge of a cycle" $
+      -- The witness starts at the lowest ID, so the closing edge runs from
+      -- the cycle's last member back to it.
+      withRepo [dependsOn idA [idB], dependsOn idB [idA]] $ \store ->
+        case dependencyCycles store of
+          [c] -> do
+            let (lower, higher) = (min (uid idA) (uid idB), max (uid idA) (uid idB))
+            take 1 (cycleWitness c) `shouldBe` [lower]
+            cycleClosing c `shouldBe` (higher, lower)
+          other -> expectationFailure ("expected one cycle, got " <> show (length other))
+
+    it "bounds a cycle witness and its rendered finding regardless of graph size" $ do
+      -- A long chain with one back edge is the expected shape of a real
+      -- roadmap graph, so neither the witness nor the finding may grow with it.
+      ids <- forM [1 :: Int .. 200] (const newUuidV7)
+      let chain = zipWith (\self next -> (item (uuidText self) "n") {itemDepends = [next]}) ids (drop 1 ids <> take 1 ids)
+      withRepo chain $ \store ->
+        case dependencyCycles store of
+          [c] -> do
+            cycleLength c `shouldBe` 200
+            length (cycleWitness c) `shouldBe` cycleWitnessLimit
+            forM_ (validate store) $ \finding ->
+              T.length (findingText finding) `shouldSatisfy` (< 300)
+          other -> expectationFailure ("expected one cycle, got " <> show (length other))
 
     it "reports no cycle for a diamond" $
       withRepo [dependsOn idA [idB, idC], dependsOn idB [idC], item idC "C"] $ \store -> do
@@ -416,7 +538,7 @@ main = hspec $ do
 
     it "detects a self-dependency" $
       withRepo [dependsOn idA [idA]] $ \store -> do
-        dependencyCycles store `shouldBe` [[uid idA]]
+        map cycleWitness (dependencyCycles store) `shouldBe` [[uid idA]]
         validate store `shouldSatisfy` elem (SelfDependency (uid idA))
 
   describe "readiness" $ do
@@ -536,7 +658,11 @@ main = hspec $ do
 
     it "parses list filters" $
       parseCommand ["list", "--state", "open", "--kind", "task", "--tag", "runtime", "--ready"]
-        `shouldBe` Right (List emptyFilters {filterStates = [Open], filterKinds = [Task], filterTags = ["runtime"], filterReady = True})
+        `shouldBe` Right
+          ( List
+              emptyFilters {filterStates = [Open], filterKinds = [Task], filterTags = ["runtime"], filterReady = True}
+              Table
+          )
 
     it "maps transitions onto states" $ do
       map transitionState [ToActive, ToDone, ToCancelled, ToOpen, ToDeferred, ToBlocked]
@@ -551,7 +677,103 @@ main = hspec $ do
       parseCommand ["next", "extra"] `shouldSatisfy` isLeft
 
     it "defaults to help with no arguments" $
-      parseCommand [] `shouldBe` Right Help
+      parseCommand [] `shouldBe` Right (Help Nothing)
+
+    it "names an unknown option rather than reporting a missing value" $ do
+      -- --help is not a 'new' option, and reporting it as a missing value
+      -- hides both facts: that it is unknown and what is accepted.
+      parseCommand ["new", "x", "--priority", "high"] `shouldSatisfy` failsWith "unknown option for 'new': --priority"
+      parseCommand ["new", "x", "--priority", "high"] `shouldSatisfy` failsWith "--kind <kind>"
+      parseCommand ["list", "--priority"] `shouldSatisfy` failsWith "unknown option for 'list': --priority"
+
+    it "reports a known option that is missing its value as such" $
+      parseCommand ["new", "x", "--kind"] `shouldSatisfy` failsWith "missing value for --kind"
+
+    it "prints per-command help for a command's own options" $ do
+      parseCommand ["new", "--help"] `shouldBe` Right (Help (Just "new"))
+      parseCommand ["help", "list"] `shouldBe` Right (Help (Just "list"))
+      parseCommand ["help", "frobnicate"] `shouldSatisfy` failsWith "unknown command"
+      commandUsage "list" `shouldSatisfy` isInfixOf "--ready"
+      commandUsage "key" `shouldSatisfy` isInfixOf "--unset"
+
+    it "parses every output format and rejects an unknown one" $ do
+      map parseFormat ["table", "id", "json"] `shouldBe` [Right Table, Right Ids, Right Json]
+      parseFormat "yaml" `shouldSatisfy` failsWith "invalid format: yaml"
+      parseCommand ["list", "--format", "yaml"] `shouldSatisfy` failsWith "invalid format"
+      parseCommand ["list", "--format", "id"] `shouldBe` Right (List emptyFilters Ids)
+      parseCommand ["next", "--format", "json"] `shouldBe` Right (Next Json)
+      parseCommand ["query", "state", "=", "open", "--format", "id"]
+        `shouldBe` Right (Query "state = open" Ids)
+
+    it "parses a key assignment and a key removal" $ do
+      parseCommand ["key", idA, "C9.4"] `shouldBe` Right (SetKey (ById (uid idA)) (Just "C9.4"))
+      parseCommand ["key", idA, "--unset"] `shouldBe` Right (SetKey (ById (uid idA)) Nothing)
+      parseCommand ["key", idA] `shouldSatisfy` isLeft
+
+    it "rejects a malformed tag before it can be written" $ do
+      -- The store refuses to load an item with a whitespace tag, so a write
+      -- command that accepted one would produce a file the CLI cannot repair.
+      parseCommand ["new", "x", "--tag", "two words"] `shouldSatisfy` failsWith "must not contain whitespace"
+      parseCommand ["tag", idA, "two words"] `shouldSatisfy` failsWith "must not contain whitespace"
+      parseCommand ["list", "--tag", "two words"] `shouldSatisfy` failsWith "must not contain whitespace"
+      parseTag "runtime" `shouldBe` Right "runtime"
+
+    it "still accepts a malformed tag for removal" $
+      -- Rejecting it here would leave a tag that only a hand edit can undo.
+      parseCommand ["untag", idA, "two words"]
+        `shouldBe` Right (Tag False (ById (uid idA)) ["two words"])
+
+    it "parses the version request" $ do
+      parseCommand ["--version"] `shouldBe` Right Version
+      parseCommand ["version"] `shouldBe` Right Version
+
+  describe "exit status" $ do
+    it "separates findings, usage failures and rejected commands" $
+      -- A CI gate has to distinguish "the tracker is invalid" from "there is
+      -- no tracker here", so the two must never share an exit status.
+      map failureStatus [Findings "x", Usage "y", Rejected "z"] `shouldBe` [1, 2, 3]
+
+    it "exits 0 with a summary over a clean store" $
+      withRepo [item idA "A"] $ \store ->
+        withCurrentDirectory (layoutRoot (storeLayout store)) $
+          runCommand Check `shouldReturn` Right "checked 1 work item(s): no findings\n"
+
+    it "reports findings as the command's result, not as a diagnostic" $
+      withRepo [(item idA "A") {itemParent = Just missing}] $ \store ->
+        withCurrentDirectory (layoutRoot (storeLayout store)) $
+          runCommand Check >>= \case
+            Left failure@(Findings findings) -> do
+              failureStatus failure `shouldBe` 1
+              T.unpack findings `shouldSatisfy` isInfixOf "1 finding(s)"
+              T.unpack findings `shouldSatisfy` isInfixOf "dangling parent reference"
+            other -> expectationFailure ("expected findings, got " <> show other)
+
+    it "distinguishes a missing tracker from an invalid one" $
+      -- Tracker discovery ascends, so the probe directory must have no
+      -- .tasks in it or in any parent.
+      withBareDirectory $ \bare -> do
+        result <- withCurrentDirectory bare (runCommand Check)
+        case result of
+          Left failure@(Usage err) -> do
+            failureStatus failure `shouldBe` 2
+            err `shouldSatisfy` isInfixOf "no tracker found"
+          other -> expectationFailure ("expected a usage failure, got " <> show other)
+
+    it "reports an unresolvable item as a rejected command, not a usage error" $
+      withRepo [item idA "A"] $ \store ->
+        withCurrentDirectory (layoutRoot (storeLayout store)) $
+          runCommand (Show (ById (uid idB))) >>= \case
+            Left failure@(Rejected err) -> do
+              failureStatus failure `shouldBe` 3
+              err `shouldSatisfy` isInfixOf "no work item with id"
+            other -> expectationFailure ("expected a rejected command, got " <> show other)
+
+    it "prints the package version" $
+      runCommand Version >>= \case
+        Right rendered -> do
+          T.unpack (T.strip rendered) `shouldSatisfy` isInfixOf "0.1.0.0"
+          T.unpack rendered `shouldSatisfy` isSuffixOf "\n"
+        other -> expectationFailure ("expected a version, got " <> show other)
 
   describe "state transitions" $ do
     it "close sets done and a closed timestamp" $
@@ -635,11 +857,26 @@ main = hspec $ do
 
     it "refuses a key already claimed by another item" $
       withRepo [item idA "A", keyed idB "C9.3"] $ \store ->
-        plan store later (SetKey (ById (uid idA)) "C9.3") `shouldSatisfy` isLeft
+        plan store later (SetKey (ById (uid idA)) (Just "C9.3")) `shouldSatisfy` isLeft
 
     it "allows an item to keep its own key" $
       withRepo [keyed idA "C9.3"] $ \store ->
-        plan store later (SetKey (ById (uid idA)) "C9.3") `shouldSatisfy` isRight'
+        plan store later (SetKey (ById (uid idA)) (Just "C9.3")) `shouldSatisfy` isRight'
+
+    it "unsets a key without disturbing relationships" $
+      -- Relationships persist UUIDs, so dropping the display alias must
+      -- leave every edge byte-identical and the store valid.
+      withRepo [(keyed idA "C9.3") {itemDepends = [uid idB], itemParent = Just (uid idC)}, item idB "B", item idC "C"] $ \store ->
+        case plan store later (SetKey (ById (uid idA)) Nothing) of
+          Right (Written [updated]) -> do
+            itemKey updated `shouldBe` Nothing
+            itemDepends updated `shouldBe` [uid idB]
+            itemParent updated `shouldBe` Just (uid idC)
+            itemUpdated updated `shouldBe` Just later
+            _ <- saveItem (storeLayout store) updated
+            reloaded <- loadStore (storeLayout store)
+            validate reloaded `shouldBe` []
+          other -> expectationFailure (show' other)
 
     it "supersede records the replaced item without changing its state" $
       withRepo [item idA "new", item idB "old"] $ \store ->
@@ -675,6 +912,40 @@ main = hspec $ do
         _ <- pure (mermaidGraph store)
         reloaded <- loadStore (storeLayout store)
         length (storeItems reloaded) `shouldBe` 1
+
+    it "enumerates canonical ids in full, one per line" $
+      -- The KEY column is deliberately abbreviated, so a script needs a
+      -- form that emits identities it can feed straight back in.
+      withRepo [item idA "A", item idB "B"] $ \store -> do
+        let rendered = idLines (storeItems store)
+        sort (T.lines rendered) `shouldBe` sort [idA, idB]
+        forM_ (T.lines rendered) $ \line -> T.length line `shouldBe` 36
+
+    it "renders an empty selection as no output at all" $
+      withRepo [] $ \store -> do
+        idLines (storeItems store) `shouldBe` ""
+        jsonLines store (storeItems store) `shouldBe` ""
+
+    it "emits one JSON object per item with full ids in every relationship" $
+      withRepo [(keyed idA "C9.4") {itemDepends = [uid idB], itemParent = Just (uid idC)}, closed idB, item idC "C"] $ \store -> do
+        a <- resolve store idA
+        case T.lines (jsonLines store [a]) of
+          [line] -> do
+            let rendered = T.unpack line
+            rendered `shouldSatisfy` isInfixOf ("\"id\":\"" <> T.unpack idA <> "\"")
+            rendered `shouldSatisfy` isInfixOf "\"key\":\"C9.4\""
+            rendered `shouldSatisfy` isInfixOf ("\"depends\":[\"" <> T.unpack idB <> "\"]")
+            rendered `shouldSatisfy` isInfixOf ("\"parent\":\"" <> T.unpack idC <> "\"")
+            rendered `shouldSatisfy` isInfixOf "\"ready\":true"
+            rendered `shouldSatisfy` isInfixOf "\"closed\":null"
+          other -> expectationFailure ("expected one line, got " <> show (length other))
+
+    it "escapes a title that would otherwise break the JSON line" $
+      withRepo [(item idA "A") {itemBody = "\n# a \"quoted\"\\ title\ttabbed\n"}] $ \store -> do
+        a <- resolve store idA
+        let rendered = jsonLines store [a]
+        T.length (T.filter (== '\n') rendered) `shouldBe` 1
+        T.unpack rendered `shouldSatisfy` isInfixOf "a \\\"quoted\\\"\\\\ title\\ttabbed"
 
   describe "enumerations" $
     it "round-trips every kind and state through its wire form" $ do
@@ -721,6 +992,7 @@ uniqueSorted [] = []
 -- | Describe a selector for assertions.
 describeSelector :: Selector -> Text
 describeSelector (ById u) = "id:" <> uuidText u
+describeSelector (ByPrefix p) = "prefix:" <> p
 describeSelector (ByKey k) = "key:" <> keyText k
 
 -- | The relationship fields named by dangling-reference findings.
@@ -731,6 +1003,11 @@ danglingFields findings = [fld | DanglingReference _ fld _ <- findings]
 isFilenameMismatch :: Finding -> Bool
 isFilenameMismatch FilenameMismatch {} = True
 isFilenameMismatch _ = False
+
+-- | Whether a finding is a parent cycle.
+isParentCycle :: Finding -> Bool
+isParentCycle ParentCycle {} = True
+isParentCycle _ = False
 
 -- | Whether a finding is an undecodable file.
 isUnreadable :: Finding -> Bool

@@ -8,18 +8,24 @@ Rendered output is never read back, so views cannot become authoritative:
 deleting a generated document loses nothing.
 
 Relationships are stored as canonical IDs but displayed as keys where an item
-has one, which is what makes @key@ useful without making it identity.
+has one, which is what makes @key@ useful without making it identity. That
+abbreviation is for humans, so 'idLines' and 'jsonLines' exist alongside it:
+a script enumerating the store gets full canonical identities in every
+field.
 -}
 module Myque.Render
   ( label
   , shortId
   , table
   , itemRows
+  , idLines
+  , jsonLines
   , itemDetail
   , mermaidGraph
   , markdownSummary
   ) where
 
+import Data.Char (ord)
 import Data.List (intercalate, sortOn)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
@@ -45,6 +51,7 @@ import Myque.Item
 import Myque.Store (Store (..), storeItems)
 import Myque.Timestamp (timestampText)
 import Myque.Uuid (Uuid, uuidText)
+import Numeric (showHex)
 
 {- | How an item is named in output: its key when it has one, otherwise a
 short prefix of its canonical ID.
@@ -93,6 +100,83 @@ itemRows store items = table ["KEY", "KIND", "STATE", "TITLE"] (map row items)
     , itemTitle item
     ]
   readyMark item = if isReady store edges item then " (ready)" else ""
+
+{- | One canonical 36-character ID per line, in the order the items were
+given. An empty selection renders as the empty text, so a caller reading
+lines sees no items rather than one blank one.
+-}
+idLines :: [WorkItem] -> Text
+idLines = foldMap (\item -> uuidText (itemId item) <> "\n")
+
+{- | NDJSON: one object per item, one line each. Every relationship field
+carries canonical IDs, and @ready@ is included because it is derived rather
+than stored, so a consumer never has to reimplement readiness or reparse
+frontmatter.
+-}
+jsonLines :: Store -> [WorkItem] -> Text
+jsonLines store = foldMap (\item -> object (itemFields store edges item) <> "\n")
+ where
+  edges = edgesOf store
+
+-- | The JSON fields of one item, in a stable order.
+itemFields :: Store -> Edges -> WorkItem -> [(Text, Json)]
+itemFields store edges item =
+  [ ("id", JString (uuidText (itemId item)))
+  , ("key", maybe JNull (JString . keyText) (itemKey item))
+  , ("kind", JString (kindText (itemKind item)))
+  , ("state", JString (stateText (itemState item)))
+  , ("title", JString (itemTitle item))
+  , ("ready", JBool (isReady store edges item))
+  , ("created", JString (timestampText (itemCreated item)))
+  , ("updated", maybe JNull (JString . timestampText) (itemUpdated item))
+  , ("closed", maybe JNull (JString . timestampText) (itemClosed item))
+  , ("tags", JArray (map JString (itemTags item)))
+  , ("parent", maybe JNull (JString . uuidText) (itemParent item))
+  , ("children", ids (childrenOf edges item))
+  , ("depends", ids (dependenciesOf edges item))
+  , ("blocks", ids (blockedBy edges item))
+  , ("related", ids (itemRelated item))
+  , ("duplicate_of", maybe JNull (JString . uuidText) (itemDuplicateOf item))
+  , ("supersedes", ids (itemSupersedes item))
+  ]
+ where
+  ids = JArray . map (JString . uuidText)
+
+-- | The JSON values the item projection needs. Numbers are not among them.
+data Json
+  = JString Text
+  | JBool Bool
+  | JNull
+  | JArray [Json]
+
+-- | Render an object on one line.
+object :: [(Text, Json)] -> Text
+object pairs = "{" <> T.intercalate "," [string k <> ":" <> value v | (k, v) <- pairs] <> "}"
+
+-- | Render a JSON value.
+value :: Json -> Text
+value = \case
+  JString t -> string t
+  JBool True -> "true"
+  JBool False -> "false"
+  JNull -> "null"
+  JArray vs -> "[" <> T.intercalate "," (map value vs) <> "]"
+
+{- | A JSON string literal. Item titles come from arbitrary Markdown, so
+quotes, backslashes and control characters all have to be escaped.
+-}
+string :: Text -> Text
+string t = "\"" <> T.concatMap escape t <> "\""
+ where
+  escape c = case c of
+    '"' -> "\\\""
+    '\\' -> "\\\\"
+    '\n' -> "\\n"
+    '\r' -> "\\r"
+    '\t' -> "\\t"
+    _
+      | c < ' ' || c == '\DEL' -> "\\u" <> T.justifyRight 4 '0' (T.pack (showHex (ord c) ""))
+      | otherwise -> T.singleton c
 
 -- | The full detail view of a single item, including derived relationships.
 itemDetail :: Store -> Edges -> WorkItem -> Text

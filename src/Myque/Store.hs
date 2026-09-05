@@ -29,9 +29,11 @@ module Myque.Store
   , Selector (..)
   , parseSelector
   , resolveSelector
+  , invalidFiles
   ) where
 
 import Data.Bifunctor (first)
+import Data.Char (isHexDigit)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
@@ -257,31 +259,109 @@ deleteItem store item = do
   removeFile path
   pure path
 
--- | A CLI reference to an item: a canonical ID or a human key.
+-- | A CLI reference to an item: a canonical ID, an abbreviated ID, or a key.
 data Selector
-  = ById Uuid
-  | ByKey Key
+  = -- | A full canonical UUID.
+    ById Uuid
+  | {- | An abbreviation of a canonical ID, as written. The same text may
+    also be a well-formed key, so resolution tries IDs first and keys
+    second, and keeps the original case for the key lookup.
+    -}
+    ByPrefix Text
+  | -- | A human key that cannot be read as an ID abbreviation.
+    ByKey Key
   deriving (Eq, Show)
 
-{- | Parse a selector. A well-formed UUID is always read as a canonical ID, so
-UUID resolution takes precedence over key lookup.
+{- | Parse a selector. A well-formed UUID is always read as a canonical ID
+and an abbreviation of one is read as a prefix, so ID resolution takes
+precedence over key lookup (specification §17.2).
 -}
 parseSelector :: Text -> Either String Selector
 parseSelector raw = case parseUuid raw of
   Right uuid -> Right (ById uuid)
-  Left _ -> ByKey <$> parseKey raw
+  Left _
+    | isIdPrefix trimmed -> Right (ByPrefix trimmed)
+    | otherwise -> ByKey <$> parseKey raw
+ where
+  trimmed = T.strip raw
 
--- | Resolve a selector against the loaded store.
+{- | Whether the text is a proper prefix of the canonical @8-4-4-4-12@ UUID
+form: hex digits, with group separators exactly where a full UUID has them.
+-}
+isIdPrefix :: Text -> Bool
+isIdPrefix t =
+  not (T.null t)
+    && T.length t < 36
+    && and (zipWith positionOk [0 :: Int ..] (T.unpack (T.toLower t)))
+ where
+  positionOk i c
+    | i `elem` [8, 13, 18, 23] = c == '-'
+    | otherwise = isHexDigit c
+
+{- | Resolve a selector against the loaded store. Ambiguity fails closed: an
+abbreviation matching several items names every candidate rather than
+picking one. An abbreviation of a file that failed to load resolves to that
+file's error, so a malformed item is reported as broken, not as absent.
+-}
 resolveSelector :: Store -> Selector -> Either String WorkItem
 resolveSelector store sel = case sel of
   ById uuid -> byId uuid
-  ByKey key -> case Map.lookup (keyText key) (storeByKey store) of
-    Nothing -> Left ("no work item with key " <> T.unpack (keyText key))
-    Just uuid
-      | ambiguous (keyText key) -> Left ("key " <> T.unpack (keyText key) <> " resolves to more than one work item")
-      | otherwise -> byId uuid
+  ByKey key -> byKey (keyText key)
+  ByPrefix prefix -> case matching prefix of
+    [uuid] -> byId uuid
+    [] -> case Map.lookup prefix (storeByKey store) of
+      Just _ -> byKey prefix
+      Nothing ->
+        Left
+          ( "no work item with an id starting "
+              <> T.unpack prefix
+              <> ", and no key "
+              <> T.unpack prefix
+          )
+    candidates ->
+      Left
+        ( "ambiguous item abbreviation "
+            <> T.unpack prefix
+            <> ": "
+            <> T.unpack (T.intercalate ", " (map uuidText candidates))
+        )
  where
+  -- Loaded items and undecodable files alike, so an abbreviation never
+  -- silently resolves past a broken file that shares its prefix. IDs are
+  -- stored lowercase, so the abbreviation is folded for the comparison only.
+  matching prefix =
+    filter
+      (T.isPrefixOf (T.toLower prefix) . uuidText)
+      (Map.keys (storeById store) <> map fst (invalidFiles store))
+
+  byKey k = case Map.lookup k (storeByKey store) of
+    Nothing -> Left ("no work item with key " <> T.unpack k)
+    Just uuid
+      | k `elem` map fst (storeDuplicateKeys store) ->
+          Left ("key " <> T.unpack k <> " resolves to more than one work item")
+      | otherwise -> byId uuid
+
   byId uuid = case Map.lookup uuid (storeById store) of
-    Nothing -> Left ("no work item with id " <> T.unpack (uuidText uuid))
     Just item -> Right item
-  ambiguous k = k `elem` map fst (storeDuplicateKeys store)
+    Nothing -> case lookup uuid (invalidFiles store) of
+      Just (LoadError path msg) ->
+        Left
+          ( "work item "
+              <> T.unpack (uuidText uuid)
+              <> " exists but is invalid, so it cannot be addressed: "
+              <> path
+              <> ": "
+              <> msg
+          )
+      Nothing -> Left ("no work item with id " <> T.unpack (uuidText uuid))
+
+{- | The load errors of files whose name is a canonical ID, keyed by that ID.
+A file that failed to decode has no item to index, but its name still names
+the identity the user will address it by.
+-}
+invalidFiles :: Store -> [(Uuid, LoadError)]
+invalidFiles store =
+  [ (uuid, err)
+  | err@(LoadError path _) <- storeLoadErrors store
+  , Right uuid <- [parseUuid (T.pack (takeBaseName path))]
+  ]

@@ -7,8 +7,9 @@ is @done@. A reference that does not resolve is never satisfied, so a
 dangling edge cannot make an item ready.
 
 The parent and dependency relations must both be acyclic. 'parentCycles' and
-'dependencyCycles' return the members of each offending cycle so that
-validation can name them.
+'dependencyCycles' report each offending cycle as a t'Cycle': a bounded
+witness path plus the edge that closes it, so a finding stays readable no
+matter how long the cycle is.
 -}
 module Myque.Graph
   ( Edges
@@ -18,13 +19,15 @@ module Myque.Graph
   , childrenOf
   , isReady
   , readyItems
+  , Cycle (..)
+  , cycleWitnessLimit
   , parentCycles
   , dependencyCycles
   , ancestorsOf
   , descendantsOf
   ) where
 
-import Data.List (nub, sort)
+import Data.List (nub, sort, sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe)
@@ -83,12 +86,33 @@ readyItems store = filter (isReady store edges) (storeItems store)
  where
   edges = edgesOf store
 
--- | The members of each @parent@ cycle, self-parents included.
-parentCycles :: Store -> [[Uuid]]
+{- | A detected cycle, reported in bounded space: the first
+'cycleWitnessLimit' nodes of a shortest cycle, the edge that closes that
+cycle, and how many nodes it really has.
+-}
+data Cycle = Cycle
+  { cycleWitness :: [Uuid]
+  -- ^ The start of a shortest cycle, in traversal order, at most 'cycleWitnessLimit' long.
+  , cycleClosing :: (Uuid, Uuid)
+  -- ^ The edge from the cycle's last node back to its first.
+  , cycleLength :: Int
+  -- ^ The number of nodes in the cycle, witness truncation aside.
+  }
+  deriving (Eq, Show)
+
+{- | How many nodes a cycle witness names. A long chain with one back edge
+is the expected shape of a real roadmap graph, so the whole path is never
+reported.
+-}
+cycleWitnessLimit :: Int
+cycleWitnessLimit = 4
+
+-- | Each @parent@ cycle, self-parents included.
+parentCycles :: Store -> [Cycle]
 parentCycles store = cyclesIn (Map.map (maybe [] pure . itemParent) (storeById store))
 
--- | The members of each dependency cycle, @blocks@ edges included.
-dependencyCycles :: Store -> [[Uuid]]
+-- | Each dependency cycle, @blocks@ edges included.
+dependencyCycles :: Store -> [Cycle]
 dependencyCycles store = cyclesIn (edgeDepends (edgesOf store))
 
 -- | The transitive @parent@ chain of an item, nearest first, cycle-safe.
@@ -111,15 +135,51 @@ descendantsOf edges item = go Set.empty (childrenOf edges item)
     | Set.member uuid seen = go seen queue
     | otherwise = uuid : go (Set.insert uuid seen) (queue <> Map.findWithDefault [] uuid (edgeChildren edges))
 
-{- | The cyclic strongly connected components of an adjacency map: every
-component of more than one vertex, plus self-loops. Edges to vertices outside
-the map are ignored, since a dangling reference is reported separately.
+{- | One bounded t'Cycle' per cyclic strongly connected component of an
+adjacency map: every component of more than one vertex, plus self-loops.
+Edges to vertices outside the map are ignored, since a dangling reference is
+reported separately.
+
+The witness is a shortest cycle through the component's lowest-numbered
+vertex, which keeps the report bounded and deterministic without depending
+on the size of the surrounding graph.
 -}
-cyclesIn :: Map Uuid [Uuid] -> [[Uuid]]
-cyclesIn adjacency = sort (map sort (filter isCycle (components adjacency)))
+cyclesIn :: Map Uuid [Uuid] -> [Cycle]
+cyclesIn adjacency = sortOn cycleWitness (map witness (filter isCycle (components adjacency)))
  where
-  isCycle [single] = single `elem` Map.findWithDefault [] single adjacency
+  isCycle [single] = single `elem` successors single
   isCycle component = length component > 1
+
+  successors n = Map.findWithDefault [] n adjacency
+
+  witness component =
+    let start = minimum component
+        rest = shortest (Set.fromList component) start
+     in Cycle
+          { cycleWitness = take cycleWitnessLimit (start : rest)
+          , cycleClosing = (if null rest then start else last rest, start)
+          , cycleLength = 1 + length rest
+          }
+
+  -- The vertices of a shortest cycle through @start@ after @start@ itself,
+  -- in traversal order. A cyclic component always contains such a cycle, so
+  -- the exhausted-queue case is unreachable; it degrades to the self-loop
+  -- rather than failing.
+  shortest component start = go (Map.singleton start start) [start]
+   where
+    go _ [] = []
+    go parents (n : queue)
+      | start `elem` reachable n = trace parents n
+      | otherwise =
+          let fresh = [m | m <- reachable n, not (Map.member m parents)]
+           in go (foldr (`Map.insert` n) parents fresh) (queue <> fresh)
+
+    reachable n = filter (`Set.member` component) (successors n)
+
+    -- The path from @start@ down to @n@, @start@ excluded.
+    trace parents n
+      | n == start = []
+      | otherwise = trace parents (Map.findWithDefault start n parents) <> [n]
 
 {- | Tarjan's strongly connected components, visiting vertices in the map's
 ascending key order so the output is deterministic.

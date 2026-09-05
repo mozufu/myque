@@ -41,6 +41,9 @@ library
     Myque.Uuid
     Myque.Validate
 
+  other-modules:    Paths_myque
+  autogen-modules:  Paths_myque
+
   hs-source-dirs:   src
   default-language: GHC2021
   build-depends:
