@@ -25,7 +25,10 @@ $ myque next                   # open, with every dependency done
 KEY     KIND  STATE         TITLE
 C9.4.1  task  open (ready)  Restart policy engine
 
-$ myque check                  # non-zero exit on any finding
+$ myque next --format id       # canonical ids, for scripts
+019a10d8-8d48-7b77-a414-f95ab7af31be
+
+$ myque check                  # 0 clean, 1 findings, 2 no tracker
 checked 4 work item(s): no findings
 ```
 
@@ -65,10 +68,24 @@ depends:
 | Relationships | `depend`, `undepend`, `parent`, `relate`, `unrelate`, `duplicate`, `supersede` |
 | Views | `graph` (Mermaid), `render` (Markdown) |
 
-An item is referenced by canonical UUID or by human key; a well-formed UUID
-always wins. `list` filters on `--state`, `--kind`, `--tag`, `--parent`, and
-`--ready`; `query` takes an expression such as
-`'tag = "runtime" and state != done'`. Run `myque help` for the full listing.
+An item is referenced by canonical UUID, by an unambiguous prefix of one, or
+by human key; ids win when both could match, and an ambiguous prefix is an
+error naming every candidate. `list` filters on `--state`, `--kind`, `--tag`,
+`--parent`, and `--ready`; `query` takes an expression such as
+`'tag = "runtime" and state != done'`. `key <item> --unset` drops an alias
+without touching a single relationship. Run `myque help` for the full
+listing, or `myque <command> --help` for one command's options.
+
+`list`, `next`, and `query` also take `--format`: `id` emits one canonical
+36-character id per line, and `json` emits NDJSON carrying full ids in every
+relationship field. Both exist because the `KEY` column is deliberately
+abbreviated — a script that needs identities should never have to parse
+frontmatter or filenames.
+
+Every value a write command accepts is validated before anything is
+written, so `myque` never produces a file its own store refuses to load. An
+item whose file exists but fails to decode is reported as invalid, naming
+the offending field, rather than as missing.
 
 An item is **ready** when it is `open` and every dependency is `done`.
 `blocks` is normalised into the dependency relation, so either side of an
@@ -77,8 +94,22 @@ edge may declare it.
 `check` validates identity (UUID form, UUIDv7, duplicates, filename/ID
 mismatch), alias uniqueness, dangling references, parent and dependency
 cycles, state/`closed` consistency, and schema conformance. The frontmatter
-schema is closed, so an unknown field is an error rather than a warning.
-Findings exit non-zero.
+schema is closed, so an unknown field is an error rather than a warning. A
+cycle finding is bounded — the start of a shortest cycle, the edge that
+closes it, and the cycle's length — so a 260-item chain with one back edge
+reports in a few hundred bytes rather than dumping every member.
+
+Exit status distinguishes the failures a CI gate has to tell apart:
+
+| Status | Meaning |
+| --- | --- |
+| `0` | Success. |
+| `1` | `check` reported findings. They are the command's result, so they go to stdout. |
+| `2` | Usage error, missing tracker, or unreadable configuration. |
+| `3` | A well-formed command that could not be carried out. |
+
+So `just tasks_check` can tell "the tracker is invalid" from "there is no
+tracker here, or I am in the wrong directory".
 
 Generated views are never authoritative: deleting them loses nothing, and
 they can always be rebuilt from the Markdown files.
@@ -161,6 +192,27 @@ cabal2nix ./. > myque.nix   # then restore the `src` argument, see the file head
 The flake filters its own source tree (`lib.cleanSourceWith`), so editing
 `flake.nix`, `flake.lock`, `.envrc`, or `.gitignore` does not invalidate the
 package derivation.
+
+## Consuming myque from another flake
+
+`myque-bin` is the advertised consumer output: `justStaticExecutables`, so
+its runtime closure is the binary and its libc rather than a GHC toolchain.
+
+```nix
+myque = {
+  url = "github:mozufu/myque";
+  inputs.nixpkgs.follows = "nixpkgs";
+};
+```
+
+Then reference `myque.packages.${system}.myque-bin`.
+
+There is no published binary cache yet, so **an uncached consumer builds
+myque from source**, which means fetching a GHC toolchain first. A CI job
+that runs `myque check` therefore needs either a warm Nix store or a cache;
+`nixbuild/nix-quick-install-action` plus `nix-community/cache-nix-action`
+keyed on `flake.lock` is the usual pairing. Budget for that before wiring
+`myque check` into a job whose toolchain is otherwise just a checkout.
 
 ## License
 
