@@ -69,7 +69,7 @@ import Myque.Item
   , stateText
   )
 import Myque.Query (parseQuery, runQuery)
-import Myque.Render (idLines, jsonLines, label, mermaidGraph)
+import Myque.Render (abbreviate, idLines, jsonLines, label, mermaidGraph)
 import Myque.Store
   ( Config (..)
   , Layout (..)
@@ -122,6 +122,14 @@ idA, idB, idC :: Text
 idA = "019a10d8-8d48-7b77-a414-f95ab7af31be"
 idB = "019a0f12-fb95-71df-8617-82e4ca982fac"
 idC = "019a018c-a43e-7cd8-903d-a45e77d78865"
+
+{- | Two IDs allocated in the same millisecond, so they agree through the
+timestamp field and differ only in entropy. This is what an import that
+backdates items to one historical closure date produces.
+-}
+sameMs1, sameMs2 :: Text
+sameMs1 = "019a10d8-8d48-7c01-b3f2-0e6c1a9d4471"
+sameMs2 = "019a10d8-8d48-7c01-9a04-52b7e8f0cd33"
 
 -- | The example item from the specification, verbatim.
 specExample :: Text
@@ -326,10 +334,10 @@ main = hspec $ do
 
   describe "selectors" $ do
     it "accepts the abbreviation the tables print" $
-      -- list renders a keyless item as the first UUID group, so show must
-      -- consume exactly what was displayed.
+      -- Rendering abbreviates against the store, so show must consume
+      -- exactly what was displayed.
       withRepo [item idA "A"] $ \store -> do
-        sel <- either fail pure (parseSelector (label (item idA "A")))
+        sel <- either fail pure (parseSelector (label (abbreviate store) (item idA "A")))
         fmap (uuidText . itemId) (resolveSelector store sel) `shouldBe` Right idA
 
     it "reads an abbreviation as an id, never as a key" $ do
@@ -894,10 +902,40 @@ main = hspec $ do
 
   describe "rendering" $ do
     it "labels an item by key when it has one" $
-      label (keyed idA "C9.4") `shouldBe` "C9.4"
+      withRepo [keyed idA "C9.4"] $ \store ->
+        label (abbreviate store) (keyed idA "C9.4") `shouldBe` "C9.4"
 
-    it "labels an item by a short ID otherwise" $
-      label (item idA "A") `shouldBe` "019a10d8"
+    it "labels an item by an abbreviated ID otherwise" $
+      withRepo [item idA "A"] $ \store ->
+        label (abbreviate store) (item idA "A") `shouldBe` "019a10d8"
+
+    it "widens an abbreviation until it names exactly one item" $
+      -- UUIDv7's leading digits are its millisecond timestamp, so items
+      -- created in the same minute -- or backdated to one historical day by
+      -- an import -- share the whole first group. A fixed width would print
+      -- one repeated token for all of them.
+      withRepo [item sameMs1 "A", item sameMs2 "B", item idC "C"] $ \store -> do
+        let abbrev = abbreviate store
+            one = label abbrev (item sameMs1 "A")
+            two = label abbrev (item sameMs2 "B")
+        one `shouldSatisfy` (/= two)
+        T.take 8 one `shouldBe` T.take 8 two
+        label abbrev (item idC "C") `shouldBe` "019a018c"
+
+    it "prints only abbreviations that resolve back to one item" $
+      -- Specification §17.2: displaying an identifier the tool cannot
+      -- consume is a defect, so every rendered label must round-trip.
+      withRepo [item sameMs1 "A", item sameMs2 "B", keyed idC "IO4"] $ \store ->
+        forM_ (storeItems store) $ \it -> do
+          sel <- either fail pure (parseSelector (label (abbreviate store) it))
+          fmap itemId (resolveSelector store sel) `shouldBe` Right (itemId it)
+
+    it "never abbreviates onto a group separator" $
+      -- A prefix ending in '-' is not a well-formed selector, so widening
+      -- has to step over the separator positions.
+      withRepo [item sameMs1 "A", item sameMs2 "B"] $ \store ->
+        forM_ (storeItems store) $ \it ->
+          T.last (label (abbreviate store) it) `shouldSatisfy` (/= '-')
 
     it "emits a Mermaid node per item and an edge per relationship" $
       withRepo [dependsOn idA [idB], (item idB "B") {itemParent = Just (uid idC)}, item idC "C"] $ \store -> do

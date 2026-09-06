@@ -71,7 +71,18 @@ import Myque.Item
   , stateText
   )
 import Myque.Query (parseQuery, runQuery)
-import Myque.Render (idLines, itemDetail, itemRows, jsonLines, label, markdownSummary, mermaidGraph)
+import Myque.Render
+  ( Abbrev
+  , abbreviate
+  , abbreviateWith
+  , idLines
+  , itemDetail
+  , itemRows
+  , jsonLines
+  , label
+  , markdownSummary
+  , mermaidGraph
+  )
 import Myque.Store
   ( Layout (..)
   , Selector
@@ -662,7 +673,8 @@ create store title kind key tags parentSel = do
     Left err -> pure (Left err)
     Right item -> do
       path <- saveItem (storeLayout store) item
-      pure (Right (T.unlines ["created " <> label item, uuidText (itemId item), relativeTo store path]))
+      let abbrev = abbreviateWith store [itemId item]
+      pure (Right (T.unlines ["created " <> label abbrev item, uuidText (itemId item), relativeTo store path]))
  where
   build uuid now = do
     parent <- traverse (fmap itemId . resolveSelector store) parentSel
@@ -680,14 +692,15 @@ mutate store cmd = do
     Left err -> pure (Left err)
     Right (Deleted item) -> do
       path <- deleteItem store item
-      pure (Right (T.unlines ["deleted " <> label item, relativeTo store path]))
+      pure (Right (T.unlines ["deleted " <> label abbrev item, relativeTo store path]))
     Right (Written items) -> do
       forM_ items (saveItem (storeLayout store))
       pure (Right (T.unlines (map describe items)))
  where
+  abbrev = abbreviate store
   describe item =
     "updated "
-      <> label item
+      <> label abbrev item
       <> " ("
       <> stateText (itemState item)
       <> ") -> "
@@ -713,7 +726,7 @@ plan :: Store -> Timestamp -> Command -> Either String Effect
 plan store now cmd = case cmd of
   Transit t sel -> do
     item <- resolveSelector store sel
-    written . pure <$> applyTransition now t item
+    written . pure <$> applyTransition abbrev now t item
   SetKey sel Nothing -> do
     item <- resolveSelector store sel
     Right (written [item {itemKey = Nothing}])
@@ -739,7 +752,7 @@ plan store now cmd = case cmd of
     dep <- resolveSelector store depSel
     when (itemId item == itemId dep) (Left "an item cannot depend on itself")
     when (adding && Set.member (itemId item) (dependencyClosure store (itemId dep))) $
-      Left ("that dependency would create a cycle: " <> T.unpack (label dep) <> " already depends on " <> T.unpack (label item))
+      Left ("that dependency would create a cycle: " <> T.unpack (label abbrev dep) <> " already depends on " <> T.unpack (label abbrev item))
     let updated
           | adding = nub (itemDepends item <> [itemId dep])
           | otherwise = filter (/= itemId dep) (itemDepends item)
@@ -751,7 +764,7 @@ plan store now cmd = case cmd of
       Just p -> do
         when (itemId item == itemId p) (Left "an item cannot be its own parent")
         when (itemId p `elem` descendantsOf (edgesOf store) item) $
-          Left ("that parent would create a cycle: " <> T.unpack (label p) <> " is already a descendant")
+          Left ("that parent would create a cycle: " <> T.unpack (label abbrev p) <> " is already a descendant")
         Right (written [item {itemParent = Just (itemId p)}])
   Relate adding sel otherSel -> do
     item <- resolveSelector store sel
@@ -765,7 +778,7 @@ plan store now cmd = case cmd of
     item <- resolveSelector store sel
     canonical <- resolveSelector store canonicalSel
     when (itemId item == itemId canonical) (Left "an item cannot be a duplicate of itself")
-    cancelled <- applyTransition now ToCancelled item {itemDuplicateOf = Just (itemId canonical)}
+    cancelled <- applyTransition abbrev now ToCancelled item {itemDuplicateOf = Just (itemId canonical)}
     Right (written [cancelled])
   Supersede newSel oldSel -> do
     newer <- resolveSelector store newSel
@@ -775,15 +788,16 @@ plan store now cmd = case cmd of
   Remove sel -> Deleted <$> resolveSelector store sel
   _ -> Left "internal error: not a mutating command"
  where
+  abbrev = abbreviate store
   written = Written . map (\item -> item {itemUpdated = Just now})
 
 {- | Apply a state transition, keeping @closed@ consistent: terminal states
 gain a timestamp, non-terminal states lose theirs.
 -}
-applyTransition :: Timestamp -> Transition -> WorkItem -> Either String WorkItem
-applyTransition now t item
+applyTransition :: Abbrev -> Timestamp -> Transition -> WorkItem -> Either String WorkItem
+applyTransition abbrev now t item
   | target == itemState item && isJust (itemClosed item) == terminal =
-      Left (T.unpack (label item) <> " is already " <> T.unpack (stateText target))
+      Left (T.unpack (label abbrev item) <> " is already " <> T.unpack (stateText target))
   | otherwise = Right item {itemState = target, itemClosed = if terminal then Just closed else Nothing}
  where
   target = transitionState t

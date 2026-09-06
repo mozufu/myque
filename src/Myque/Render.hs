@@ -8,14 +8,19 @@ Rendered output is never read back, so views cannot become authoritative:
 deleting a generated document loses nothing.
 
 Relationships are stored as canonical IDs but displayed as keys where an item
-has one, which is what makes @key@ useful without making it identity. That
-abbreviation is for humans, so 'idLines' and 'jsonLines' exist alongside it:
-a script enumerating the store gets full canonical identities in every
+has one, which is what makes @key@ useful without making it identity. A
+keyless item is displayed by an 'Abbrev' of its ID, which is computed against
+the store so that it always resolves back to exactly one item. That
+abbreviation is still for humans, so 'idLines' and 'jsonLines' exist alongside
+it: a script enumerating the store gets full canonical identities in every
 field.
 -}
 module Myque.Render
-  ( label
-  , shortId
+  ( Abbrev
+  , abbrevOf
+  , abbreviate
+  , abbreviateWith
+  , label
   , table
   , itemRows
   , idLines
@@ -26,7 +31,8 @@ module Myque.Render
   ) where
 
 import Data.Char (ord)
-import Data.List (intercalate, sortOn)
+import Data.List (intercalate, sort, sortOn)
+import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (mapMaybe)
 import Data.Text (Text)
@@ -48,24 +54,75 @@ import Myque.Item
   , kindText
   , stateText
   )
-import Myque.Store (Store (..), storeItems)
+import Myque.Store (Store (..), invalidFiles, storeItems)
 import Myque.Timestamp (timestampText)
 import Myque.Uuid (Uuid, uuidText)
 import Numeric (showHex)
 
-{- | How an item is named in output: its key when it has one, otherwise a
-short prefix of its canonical ID.
+{- | The shortest unique abbreviation of every canonical ID in a store.
+
+A UUIDv7's leading hex digits are its millisecond timestamp, so items created
+in the same minute — or backdated to the same historical day by an import —
+share a long common prefix. A fixed-width abbreviation therefore degenerates
+to one repeated token exactly when a store holds many items, which is when a
+listing has to distinguish them.
 -}
-label :: WorkItem -> Text
-label item = maybe (shortId (itemId item)) keyText (itemKey item)
+newtype Abbrev = Abbrev (Map Uuid Text)
 
--- | The first group of a UUID, enough to recognise an item by eye.
-shortId :: Uuid -> Text
-shortId = T.takeWhile (/= '-') . uuidText
+{- | Compute abbreviations for a store: for each ID, the shortest prefix no
+other ID shares, never below 'abbrevFloor' characters and never past the
+full 36. Group separators are included in the count, so an abbreviation is
+always a valid selector prefix (see 'Myque.Store.isIdPrefix').
+-}
+abbreviate :: Store -> Abbrev
+abbreviate store = abbreviateWith store []
 
--- | Name an ID by resolving it in the store, falling back to a short ID.
-labelOf :: Store -> Uuid -> Text
-labelOf store uuid = maybe (shortId uuid) label (Map.lookup uuid (storeById store))
+{- | 'abbreviate', additionally disambiguating IDs the store does not hold
+yet. @new@ names the item it just created, whose file the loaded store
+predates, and that name has to be unique against everything already there.
+-}
+abbreviateWith :: Store -> [Uuid] -> Abbrev
+abbreviateWith store extra = Abbrev (Map.fromList [(uuid, shortest uuid) | uuid <- uuids])
+ where
+  -- Undecodable files too: their names are identities a user will address,
+  -- and an abbreviation that ignored them could resolve ambiguously.
+  uuids = Map.keys (storeById store) <> map fst (invalidFiles store) <> extra
+  texts = sort (map uuidText uuids)
+
+  shortest uuid = go (candidates (uuidText uuid))
+   where
+    go [] = uuidText uuid
+    go (c : cs)
+      | unique c = c
+      | otherwise = go cs
+
+  -- Only lengths that leave a well-formed prefix: a UUID's separators sit at
+  -- 8, 13, 18 and 23, and a prefix must not end on one.
+  candidates full =
+    [T.take n full | n <- [abbrevFloor .. 35], n `notElem` [9, 14, 19, 24]]
+
+  unique prefix = length (filter (T.isPrefixOf prefix) texts) == 1
+
+{- | The minimum abbreviation width. Eight digits is one UUID group, which is
+what a reader recognises, and matches the width Git uses for the same job.
+-}
+abbrevFloor :: Int
+abbrevFloor = 8
+
+-- | An ID's abbreviation, or its full text when the store does not hold it.
+abbrevOf :: Abbrev -> Uuid -> Text
+abbrevOf (Abbrev m) uuid = Map.findWithDefault (uuidText uuid) uuid m
+
+{- | How an item is named in output: its key when it has one, otherwise the
+shortest abbreviation of its canonical ID that the store makes unambiguous.
+-}
+label :: Abbrev -> WorkItem -> Text
+label abbrev item = maybe (abbrevOf abbrev (itemId item)) keyText (itemKey item)
+
+-- | Name an ID by resolving it in the store, falling back to its abbreviation.
+labelOf :: Store -> Abbrev -> Uuid -> Text
+labelOf store abbrev uuid =
+  maybe (abbrevOf abbrev uuid) (label abbrev) (Map.lookup uuid (storeById store))
 
 {- | Render a header and rows as a left-aligned, space-padded table. The last
 column is not padded, so output stays easy to pipe into other tools.
@@ -93,8 +150,9 @@ itemRows :: Store -> [WorkItem] -> Text
 itemRows store items = table ["KEY", "KIND", "STATE", "TITLE"] (map row items)
  where
   edges = edgesOf store
+  abbrev = abbreviate store
   row item =
-    [ label item
+    [ label abbrev item
     , kindText (itemKind item)
     , stateText (itemState item) <> readyMark item
     , itemTitle item
@@ -193,15 +251,16 @@ itemDetail store edges item =
       <> field "updated" (timestampText <$> itemUpdated item)
       <> field "closed" (timestampText <$> itemClosed item)
       <> list "tags" (itemTags item)
-      <> field "parent" (labelOf store <$> itemParent item)
-      <> list "children" (map (labelOf store) (childrenOf edges item))
-      <> list "depends" (map (dependencyLabel store) (dependenciesOf edges item))
-      <> list "blocks" (map (labelOf store) (blockedBy edges item))
-      <> list "related" (map (labelOf store) (itemRelated item))
-      <> field "duplicate_of" (labelOf store <$> itemDuplicateOf item)
-      <> list "supersedes" (map (labelOf store) (itemSupersedes item))
+      <> field "parent" (labelOf store abbrev <$> itemParent item)
+      <> list "children" (map (labelOf store abbrev) (childrenOf edges item))
+      <> list "depends" (map (dependencyLabel store abbrev) (dependenciesOf edges item))
+      <> list "blocks" (map (labelOf store abbrev) (blockedBy edges item))
+      <> list "related" (map (labelOf store abbrev) (itemRelated item))
+      <> field "duplicate_of" (labelOf store abbrev <$> itemDuplicateOf item)
+      <> list "supersedes" (map (labelOf store abbrev) (itemSupersedes item))
       <> ["", T.stripEnd (T.stripStart (itemBody item))]
  where
+  abbrev = abbreviate store
   readiness = if isReady store edges item then " (ready)" else ""
   field name = maybe [] (\v -> [pad name <> v])
   list _ [] = []
@@ -211,12 +270,12 @@ itemDetail store edges item =
 {- | A dependency label annotated with whether it is satisfied, so an unready
 item shows why.
 -}
-dependencyLabel :: Store -> Uuid -> Text
-dependencyLabel store uuid = case Map.lookup uuid (storeById store) of
-  Nothing -> shortId uuid <> " (missing)"
+dependencyLabel :: Store -> Abbrev -> Uuid -> Text
+dependencyLabel store abbrev uuid = case Map.lookup uuid (storeById store) of
+  Nothing -> abbrevOf abbrev uuid <> " (missing)"
   Just dep
-    | itemState dep == Done -> label dep
-    | otherwise -> label dep <> " (" <> stateText (itemState dep) <> ")"
+    | itemState dep == Done -> label abbrev dep
+    | otherwise -> label abbrev dep <> " (" <> stateText (itemState dep) <> ")"
 
 {- | A Mermaid flowchart of the parent and dependency relations. Parent edges
 are dotted containment arrows; dependency edges point from dependency to
@@ -235,11 +294,12 @@ mermaidGraph store =
  where
   items = storeItems store
   edges = edgesOf store
+  abbrev = abbreviate store
   node item =
     "  "
       <> nodeId (itemId item)
       <> "[\""
-      <> escape (label item <> ": " <> itemTitle item)
+      <> escape (label abbrev item <> ": " <> itemTitle item)
       <> "\"]:::"
       <> stateText (itemState item)
   parentEdge item = ["  " <> nodeId p <> " -.-> " <> nodeId (itemId item) | Just p <- [itemParent item], known p]
@@ -270,12 +330,13 @@ markdownSummary store =
       <> intercalate [""] (mapMaybe section [Active, Open, Blocked, Deferred, Done, Cancelled])
  where
   edges = edgesOf store
-  section state = case sortOn label (filter ((== state) . itemState) (storeItems store)) of
+  abbrev = abbreviate store
+  section state = case sortOn (label abbrev) (filter ((== state) . itemState) (storeItems store)) of
     [] -> Nothing
     items -> Just (("## " <> stateText state) : "" : map bullet items)
   bullet item =
     "- **"
-      <> label item
+      <> label abbrev item
       <> "** ("
       <> kindText (itemKind item)
       <> ") "
