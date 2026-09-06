@@ -76,6 +76,12 @@ error naming every candidate. `list` filters on `--state`, `--kind`, `--tag`,
 without touching a single relationship. Run `myque help` for the full
 listing, or `myque <command> --help` for one command's options.
 
+A keyless item is displayed as the shortest prefix of its id that no other
+id shares, widened as needed and never below eight digits, so what a table
+prints always resolves back to one item. That matters because a UUIDv7
+begins with its millisecond timestamp: items created in the same minute, or
+backdated to one date by an import, agree through the whole first group.
+
 `list`, `next`, and `query` also take `--format`: `id` emits one canonical
 36-character id per line, and `json` emits NDJSON carrying full ids in every
 relationship field. Both exist because the `KEY` column is deliberately
