@@ -2,13 +2,13 @@
 
 A local-first, Git-native work item tracker for tasks, issues, bugs,
 milestones, epics, and follow-up work, implementing
-[`docs/spec.md`](docs/spec.md) (`work-item/v1`). Packaged as a Nix flake.
+[`docs/spec.md`](docs/spec.md) (`work-item/v2`, strict v1 read support). Packaged as a Nix flake.
 
-Canonical state is one Markdown file per item under `.tasks/items/`, named
-after the item's identity. There is no server, database, account, or central
-ID allocator: identity is a UUIDv7 allocated locally, so two Git branches can
-each create items with no shared registry, sequence counter, or
-ID-allocation race. Human keys such as `C9.4` are presentation aliases —
+Canonical active state is one Markdown file per item under `.tasks/items/`, named
+after its UUIDv7 identity. Retired identities resolve offline through minimal
+`.tasks/terminal/` records; exact historical bodies remain in retained Git refs.
+There is no server or account. MyQue allocates UUIDs locally and offers a locked,
+recoverable compare-and-swap machine API. Human keys such as `C9.4` are aliases —
 relationships always persist UUIDs, so renaming a key rewrites nothing else.
 
 ```console
@@ -36,7 +36,7 @@ A canonical item file:
 
 ```markdown
 ---
-schema: work-item/v1
+schema: work-item/v2
 id: 019a10d8-8d48-7b77-a414-f95ab7af31be
 key: C9.4
 kind: milestone
@@ -57,12 +57,19 @@ depends:
 - A supervisor can restart a failed component.
 ```
 
+MyQue 0.2 adds open-record consumer YAML, byte-preserving after-title bodies,
+idempotent admission and guarded lifecycle commands. See the [canonical v2
+contract](docs/spec.md) for exact JSON requests, consumer retention declaration,
+retained-ref backup, migration and recovery. Direct `close` changes task state;
+it is not a substitute for a consumer's evidence eligibility check. Consumer
+helpers should use `start UUID --expected REV` / `close UUID --expected REV`.
+
 ## Commands
 
 | Group | Commands |
 | --- | --- |
-| Storage | `init`, `check` |
-| Items | `new`, `show`, `list`, `next`, `query`, `rm` |
+| Storage | `init`, `check`, `api get/create/put`, `migrate`, `retire` |
+| Items | `new`, `show`, `list`, `next`, `query` (`rm` refuses; retire instead) |
 | State | `start`, `close`, `cancel`, `reopen`, `defer`, `block` |
 | Metadata | `key`, `title`, `tag`, `untag` |
 | Relationships | `depend`, `undepend`, `parent`, `relate`, `unrelate`, `duplicate`, `supersede` |
