@@ -6,6 +6,9 @@
   mkDerivation,
   lib,
   src,
+  # Retention and reopening shell out to Git, so the test-suite needs it and
+  # the executable is wrapped with it.
+  git,
   base,
   aeson,
   yaml,
@@ -52,6 +55,7 @@ mkDerivation {
     hspec
     text
   ];
+  testToolDepends = [ git ];
   description = "A local-first, Git-native work item tracker";
   license = lib.licenses.bsd3;
   mainProgram = "myque";

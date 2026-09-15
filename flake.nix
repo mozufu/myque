@@ -51,7 +51,7 @@
       # `callCabal2nix` call: the latter needs import-from-derivation, which is
       # disabled here (and in restricted-eval CI). Regenerate it after
       # changing dependencies in myque.cabal.
-      myqueFor = pkgs: (hsPkgsFor pkgs).callPackage ./myque.nix { inherit src; };
+      myqueFor = pkgs: (hsPkgsFor pkgs).callPackage ./myque.nix { inherit src; git = pkgs.git; };
     in
     {
       packages = forAllSystems (
@@ -66,7 +66,16 @@
 
           # Just the `myque` executable, without the library, docs, or the
           # GHC closure in the runtime dependencies.
-          myque-bin = pkgs.haskell.lib.compose.justStaticExecutables myque;
+          # Retention, reopening and migration invoke Git, so the standalone
+          # executable carries it rather than assuming the caller's PATH.
+          myque-bin = pkgs.symlinkJoin {
+            name = "myque-bin";
+            paths = [ (pkgs.haskell.lib.compose.justStaticExecutables myque) ];
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+            postBuild = ''
+              wrapProgram "$out/bin/myque" --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
+            '';
+          };
 
           myque-docs = myque.doc;
 
@@ -81,7 +90,7 @@
         default = myque;
         myque = {
           type = "app";
-          program = "${pkgs.haskell.lib.compose.justStaticExecutables (myqueFor pkgs)}/bin/myque";
+          program = "${self.packages.${pkgs.stdenv.hostPlatform.system}.myque-bin}/bin/myque";
         };
       });
 
