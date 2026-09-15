@@ -42,16 +42,21 @@ module Myque.Cli
   , main
   ) where
 
+import Control.Exception (IOException, try)
 import Control.Monad (forM_, unless, when)
+import Data.Aeson qualified as A
 import Data.Bifunctor (first)
+import Data.ByteString.Lazy qualified as BL
 import Data.List (nub)
 import Data.Map.Strict qualified as Map
 import Data.Maybe (fromMaybe, isJust)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
 import Data.Version (showVersion)
+import Myque.Api qualified as Api
 import Myque.Graph (dependenciesOf, descendantsOf, edgesOf, isReady, readyItems)
 import Myque.Item
   ( Key
@@ -96,10 +101,11 @@ import Myque.Store
   , parseSelector
   , resolveSelector
   , saveItem
+  , saveItems
   , storeItems
   )
 import Myque.Timestamp (Timestamp, currentTimestamp)
-import Myque.Uuid (Uuid, newUuidV7, uuidText)
+import Myque.Uuid (Uuid, newUuidV7, parseUuid, uuidText)
 import Myque.Validate (findingText, validate)
 import Paths_myque (version)
 import System.Directory (getCurrentDirectory)
@@ -152,6 +158,12 @@ data Command
     Version
   | -- | @myque help [\<command\>]@
     Help (Maybe Text)
+  | ApiGet Uuid
+  | ApiCreate Text
+  | ApiPut Uuid Text
+  | Migrate Selector
+  | Retire Selector Text
+  | TransitExpected Transition Uuid Text
   deriving (Eq, Show)
 
 -- | @list@ filters. Every supplied filter must hold.
@@ -215,7 +227,18 @@ parseCommand (verb : rest)
       _ -> Left "usage: myque help [<command>]"
   | any (`elem` ["--help", "-h"]) rest = helpFor verb
   | otherwise = case verb of
+      "start" | [uuid, "--expected", revision] <- rest -> TransitExpected ToActive <$> parseUuid uuid <*> pure revision
+      "close" | [uuid, "--expected", revision] <- rest -> TransitExpected ToDone <$> parseUuid uuid <*> pure revision
       "init" -> noArgs Init
+      "api" -> case rest of
+        ["get", uuid] -> ApiGet <$> parseUuid uuid
+        ["create", "--admission", token] -> Right (ApiCreate token)
+        ["put", uuid, "--expected", revision] -> ApiPut <$> parseUuid uuid <*> pure revision
+        _ -> Left "usage: myque api get UUID | create --admission TOKEN | put UUID --expected SHA256"
+      "migrate" -> Migrate <$> oneSelector
+      "retire" -> case rest of
+        [target, "--evidence", evidence] -> Retire <$> parseSelector target <*> pure evidence
+        _ -> Left "usage: myque retire ITEM --evidence TEXT (stdin: retention namespace map JSON)"
       "new" -> parseNew rest
       "show" -> Show <$> oneSelector
       "list" -> uncurry List <$> parseListArgs rest
@@ -399,6 +422,9 @@ commandGroups =
     ,
       [ ("init", CommandDoc "init" "create .tasks/ in the current directory" [])
       , ("check", CommandDoc "check" "validate every item; exit 1 on findings" [])
+      , ("api", CommandDoc "api get UUID | create --admission TOKEN | put UUID --expected REVISION" "supported JSON API; create/put read stdin" [])
+      , ("migrate", CommandDoc "migrate <item>" "retain v1 history and change envelope version only" [])
+      , ("retire", CommandDoc "retire <item> --evidence TEXT" "retire terminal item; stdin retention namespace map JSON" [("--evidence <text>", "closure evidence or cancellation reason")])
       ]
     )
   ,
@@ -499,7 +525,7 @@ formatSummary = "table (default), id (one canonical id per line), or json (NDJSO
 usage :: String
 usage =
   unlines $
-    [ "myque - a local-first, Git-native work item tracker (work-item/v1)"
+    [ "myque - a local-first, Git-native work item tracker (work-item/v2; v1 supported)"
     , ""
     , "usage: myque <command> [arguments]"
     , "       myque <command> --help"
@@ -602,6 +628,13 @@ runCommand Init = do
   layout <- initLayout cwd
   pure (Right ("initialised tracker in " <> T.pack (layoutRoot layout) <> "/.tasks\n"))
 runCommand cmd = do
+  result <- try (runStoreCommand cmd)
+  pure $ case result of
+    Left err -> Left (Rejected (show (err :: IOException)))
+    Right value -> value
+
+runStoreCommand :: Command -> IO (Either Failure Text)
+runStoreCommand cmd = do
   cwd <- getCurrentDirectory
   discoverLayout cwd >>= \case
     Left err -> pure (Left (Usage err))
@@ -610,10 +643,29 @@ runCommand cmd = do
       unless (cmd == Check) (warnLoadErrors store)
       case cmd of
         Check -> pure (check store)
+        ApiGet uuid -> Right . json <$> Api.apiGet layout uuid
+        ApiCreate token -> inputJson >>= fmap (Right . json) . Api.apiCreate layout token
+        ApiPut uuid revision -> inputJson >>= fmap (Right . json) . Api.apiPut layout uuid revision
+        Migrate sel -> special store sel (Api.migrateItem layout)
+        Retire sel evidence -> do
+          value <- inputJson
+          retained <- either (ioError . userError) pure (A.fromJSON value & resultEither)
+          special store sel (\uuid -> Api.retireItem layout uuid evidence retained)
+        Transit ToOpen sel -> special store sel (Api.reopenItem layout)
+        TransitExpected transition uuid revision -> Api.transitionItem layout uuid revision (transitionState transition) >> pure (Right (uuidText uuid <> "\n"))
         New title kind key tags parent -> first Rejected <$> create store title kind key tags parent
         _ -> case readOnly store cmd of
           Just result -> pure (first Rejected result)
           Nothing -> first Rejected <$> mutate store cmd
+ where
+  json = (<> "\n") . TE.decodeUtf8 . BL.toStrict . A.encode
+  inputJson = BL.getContents >>= either (ioError . userError) pure . A.eitherDecode
+  special store sel action = case resolveSelector store sel of
+    Left err -> pure (Left (Rejected err))
+    Right item -> action (itemId item) >> pure (Right (uuidText (itemId item) <> "\n"))
+  resultEither (A.Error err) = Left err
+  resultEither (A.Success value) = Right value
+  (&) = flip ($)
 
 {- | Report undecodable files on stderr. @check@ reports them as findings
 instead, so it suppresses this.
@@ -694,7 +746,7 @@ mutate store cmd = do
       path <- deleteItem store item
       pure (Right (T.unlines ["deleted " <> label abbrev item, relativeTo store path]))
     Right (Written items) -> do
-      forM_ items (saveItem (storeLayout store))
+      saveItems (storeLayout store) items
       pure (Right (T.unlines (map describe items)))
  where
   abbrev = abbreviate store
@@ -785,7 +837,7 @@ plan store now cmd = case cmd of
     older <- resolveSelector store oldSel
     when (itemId newer == itemId older) (Left "an item cannot supersede itself")
     Right (written [newer {itemSupersedes = nub (itemSupersedes newer <> [itemId older])}])
-  Remove sel -> Deleted <$> resolveSelector store sel
+  Remove _ -> Left "deletion is unsupported; close/cancel then retire with evidence"
   _ -> Left "internal error: not a mutating command"
  where
   abbrev = abbreviate store

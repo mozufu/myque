@@ -7,6 +7,11 @@
   lib,
   src,
   base,
+  aeson,
+  yaml,
+  crypton,
+  filelock,
+  process,
   bytestring,
   containers,
   directory,
@@ -17,12 +22,17 @@
 }:
 mkDerivation {
   pname = "myque";
-  version = "0.1.0.0";
+  version = "0.2.0.0";
   inherit src;
   isLibrary = true;
   isExecutable = true;
   libraryHaskellDepends = [
     base
+    aeson
+    yaml
+    crypton
+    filelock
+    process
     bytestring
     containers
     directory
@@ -33,6 +43,10 @@ mkDerivation {
   executableHaskellDepends = [ base ];
   testHaskellDepends = [
     base
+    aeson
+    containers
+    bytestring
+    process
     directory
     filepath
     hspec

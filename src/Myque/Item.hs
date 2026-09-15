@@ -33,11 +33,16 @@ module Myque.Item
   , decodeItem
   , encodeItem
   , outgoingIds
+  , bodyAfterTitle
+  , setBodyAfterTitle
+  , validateConsumers
   ) where
 
-import Control.Monad (when)
+import Control.Monad (unless, when)
 import Data.Char (isSpace)
 import Data.List (nub)
+import Data.Map.Strict (Map)
+import Data.Map.Strict qualified as Map
 import Data.Maybe (catMaybes, fromMaybe, mapMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -57,7 +62,7 @@ import Myque.Uuid (Uuid, isUuidV7, parseUuid, uuidText)
 
 -- | The schema identifier every canonical file carries.
 schemaVersion :: Text
-schemaVersion = "work-item/v1"
+schemaVersion = "work-item/v2"
 
 -- | The semantic role of an item. Carries no storage or identity semantics.
 data Kind
@@ -177,8 +182,14 @@ data WorkItem = WorkItem
   , itemDuplicateOf :: Maybe Uuid
   , itemSupersedes :: [Uuid]
   , itemBody :: Text
+  , itemSchema :: Text
+  , itemConsumers :: Map Text Text
+  , itemOriginal :: Maybe Text
   }
-  deriving (Eq, Show)
+  deriving (Show)
+
+instance Eq WorkItem where
+  left == right = encodeItem left == encodeItem right
 
 {- | A new @open@ item with the given identity, title and creation time, and
 no relationships.
@@ -201,6 +212,9 @@ newWorkItem uuid kind created title =
     , itemDuplicateOf = Nothing
     , itemSupersedes = []
     , itemBody = "\n# " <> T.strip title <> "\n"
+    , itemSchema = schemaVersion
+    , itemConsumers = Map.empty
+    , itemOriginal = Nothing
     }
 
 {- | The title by convention: the first ATX level-1 heading in the body. Falls
@@ -227,10 +241,32 @@ setTitle :: Text -> WorkItem -> WorkItem
 setTitle title item = item {itemBody = rewrite (itemBody item)}
  where
   replacement = "# " <> T.strip title
-  rewrite body = case break isHeading (T.lines body) of
-    (_, []) -> "\n" <> replacement <> "\n" <> body
-    (before, _ : after) -> T.unlines (before <> [replacement] <> after)
-  isHeading line = T.isPrefixOf "# " (T.stripStart line)
+  rewrite body = case T.breakOn "\n" body of
+    (line, rest)
+      | T.isPrefixOf "# " (T.stripStart line) -> replacement <> (if T.isSuffixOf "\r" line then "\r" else "") <> rest
+      | T.null rest -> "\n" <> replacement <> "\n" <> body
+      | otherwise -> line <> "\n" <> rewrite (T.drop 1 rest)
+
+{- | The opaque bytes after the title line, without splitting and rejoining
+lines. A body with no level-1 heading has no title to strip, so the whole body
+is its own opaque content; otherwise a consumer could neither read nor
+round-trip it.
+-}
+bodyAfterTitle :: WorkItem -> Text
+bodyAfterTitle = snd . titleSplit . itemBody
+
+-- | Replace exactly the bytes 'bodyAfterTitle' returns, inventing no heading.
+setBodyAfterTitle :: Text -> WorkItem -> WorkItem
+setBodyAfterTitle body item = item {itemBody = fst (titleSplit (itemBody item)) <> body}
+
+titleSplit :: Text -> (Text, Text)
+titleSplit body = go "" body
+ where
+  go prefix text =
+    let (line, rest) = T.breakOn "\n" text; consumed = line <> T.take 1 rest
+     in if T.isPrefixOf "# " (T.stripStart line)
+          then (prefix <> consumed, T.drop 1 rest)
+          else if T.null rest then ("", body) else go (prefix <> consumed) (T.drop 1 rest)
 
 -- | Every ID referenced by an item, deduplicated. Used for dangling checks.
 outgoingIds :: WorkItem -> [Uuid]
@@ -244,23 +280,7 @@ outgoingIds item =
 
 -- | The frontmatter fields the schema permits, in canonical write order.
 knownFields :: [Text]
-knownFields =
-  [ "schema"
-  , "id"
-  , "key"
-  , "kind"
-  , "state"
-  , "created"
-  , "updated"
-  , "closed"
-  , "tags"
-  , "parent"
-  , "depends"
-  , "blocks"
-  , "related"
-  , "duplicate_of"
-  , "supersedes"
-  ]
+knownFields = FM.ownedKeys
 
 -- | Decode a canonical Markdown file.
 decodeItem :: Text -> Either String WorkItem
@@ -269,11 +289,11 @@ decodeItem raw = do
   case FM.duplicateKeys fm of
     dup : _ -> Left ("duplicate frontmatter field: " <> T.unpack dup)
     [] -> pure ()
-  case filter (`notElem` knownFields) (map fst (fields fm)) of
+  schema <- requiredScalar "schema" fm
+  unless (schema `elem` ["work-item/v1", schemaVersion]) (Left ("unknown schema version: " <> T.unpack schema))
+  when (schema == "work-item/v1") $ case filter (`notElem` knownFields) (map fst (fields fm)) of
     unknown : _ -> Left ("unsupported frontmatter field: " <> T.unpack unknown)
     [] -> pure ()
-  schema <- requiredScalar "schema" fm
-  when (schema /= schemaVersion) (Left ("unknown schema version: " <> T.unpack schema))
   uuid <- requiredScalar "id" fm >>= field "id" . canonicalId
   key <- optional "key" fm parseKey
   kind <- requiredScalar "kind" fm >>= field "kind" . parseKind
@@ -309,6 +329,9 @@ decodeItem raw = do
       , itemDuplicateOf = duplicateOf
       , itemSupersedes = supersedes
       , itemBody = body
+      , itemSchema = schema
+      , itemConsumers = Map.fromList (FM.consumerEntries fm)
+      , itemOriginal = Just raw
       }
 
 -- | Parse a canonical identity: a UUID that is also a UUIDv7.
@@ -339,6 +362,7 @@ optional name fm parse = case lookupNode name fm of
     | T.null (T.strip v) -> Right Nothing
     | otherwise -> Just <$> field name (parse v)
   Just (Sequence _) -> Left ("field '" <> T.unpack name <> "' must be a scalar, not a sequence")
+  Just (Raw _) -> Left ("field '" <> T.unpack name <> "' must be a scalar")
 
 -- | An optional sequence-of-UUID field.
 uuidList :: Text -> Frontmatter -> Either String [Uuid]
@@ -359,6 +383,7 @@ sequenceField name fm = case lookupNode name fm of
   Just Empty -> Right []
   Just (Sequence vs) -> Right vs
   Just (Scalar _) -> Left ("field '" <> T.unpack name <> "' must be a sequence, not a scalar")
+  Just (Raw _) -> Left ("field '" <> T.unpack name <> "' must be a sequence")
 
 -- | Encode a work item as its canonical Markdown file.
 encodeItem :: WorkItem -> Text
@@ -368,7 +393,7 @@ encodeItem item = renderDocument (Document (frontmatterOf item) (itemBody item))
 frontmatterOf :: WorkItem -> Frontmatter
 frontmatterOf item =
   fromFields $
-    [ ("schema", Scalar schemaVersion)
+    [ ("schema", Scalar (itemSchema item))
     , ("id", Scalar (uuidText (itemId item)))
     ]
       <> scalarField "key" (keyText <$> itemKey item)
@@ -385,7 +410,19 @@ frontmatterOf item =
       <> listField "related" (map uuidText (itemRelated item))
       <> scalarField "duplicate_of" (uuidText <$> itemDuplicateOf item)
       <> listField "supersedes" (map uuidText (itemSupersedes item))
+      <> [(k, Raw raw) | (k, raw) <- Map.toAscList (itemConsumers item)]
  where
   scalarField name = maybe [] (\v -> [(name, Scalar v)])
   listField _ [] = []
   listField name vs = [(name, Sequence vs)]
+
+{- | Each supplied value is exactly one complete YAML entry in its declared
+namespace. This prevents a raw entry from smuggling an owned field.
+-}
+validateConsumers :: Map Text Text -> Either String ()
+validateConsumers consumers = mapM_ check (Map.toList consumers)
+ where
+  check (key, raw) = do
+    when (key `elem` FM.ownedKeys) (Left "consumer namespace collides with a MyQue-owned key")
+    Document fm _ <- parseDocument ("---\n" <> raw <> "---\n")
+    when (FM.consumerEntries fm /= [(key, raw)] || length (fields fm) /= 1) (Left "consumer entry must contain exactly its declared namespace and end with a newline")

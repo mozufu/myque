@@ -239,26 +239,28 @@ string t = "\"" <> T.concatMap escape t <> "\""
 -- | The full detail view of a single item, including derived relationships.
 itemDetail :: Store -> Edges -> WorkItem -> Text
 itemDetail store edges item =
-  T.unlines $
-    [ "id:       " <> uuidText (itemId item)
-    ]
-      <> field "key" (keyText <$> itemKey item)
-      <> [ "kind:     " <> kindText (itemKind item)
-         , "state:    " <> stateText (itemState item) <> readiness
-         , "title:    " <> itemTitle item
-         , "created:  " <> timestampText (itemCreated item)
-         ]
-      <> field "updated" (timestampText <$> itemUpdated item)
-      <> field "closed" (timestampText <$> itemClosed item)
-      <> list "tags" (itemTags item)
-      <> field "parent" (labelOf store abbrev <$> itemParent item)
-      <> list "children" (map (labelOf store abbrev) (childrenOf edges item))
-      <> list "depends" (map (dependencyLabel store abbrev) (dependenciesOf edges item))
-      <> list "blocks" (map (labelOf store abbrev) (blockedBy edges item))
-      <> list "related" (map (labelOf store abbrev) (itemRelated item))
-      <> field "duplicate_of" (labelOf store abbrev <$> itemDuplicateOf item)
-      <> list "supersedes" (map (labelOf store abbrev) (itemSupersedes item))
-      <> ["", T.stripEnd (T.stripStart (itemBody item))]
+  T.unlines
+    ( [ "id:       " <> uuidText (itemId item)
+      ]
+        <> field "key" (keyText <$> itemKey item)
+        <> [ "kind:     " <> kindText (itemKind item)
+           , "state:    " <> stateText (itemState item) <> readiness
+           , "title:    " <> itemTitle item
+           , "created:  " <> timestampText (itemCreated item)
+           ]
+        <> field "updated" (timestampText <$> itemUpdated item)
+        <> field "closed" (timestampText <$> itemClosed item)
+        <> list "tags" (itemTags item)
+        <> field "parent" (labelOf store abbrev <$> itemParent item)
+        <> list "children" (map (labelOf store abbrev) (childrenOf edges item))
+        <> list "depends" (map (dependencyLabel store abbrev) (dependenciesOf edges item))
+        <> list "blocks" (map (labelOf store abbrev) (blockedBy edges item))
+        <> list "related" (map (labelOf store abbrev) (itemRelated item))
+        <> field "duplicate_of" (labelOf store abbrev <$> itemDuplicateOf item)
+        <> list "supersedes" (map (labelOf store abbrev) (itemSupersedes item))
+        <> [""]
+    )
+    <> itemBody item
  where
   abbrev = abbreviate store
   readiness = if isReady store edges item then " (ready)" else ""

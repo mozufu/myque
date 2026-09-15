@@ -17,11 +17,18 @@ module Main (main) where
 
 import Control.Exception (bracket)
 import Control.Monad (forM, forM_)
+import Data.Aeson (object, (.=))
+import Data.Aeson qualified as Aeson
+import Data.ByteString.Lazy qualified as BL
 import Data.Either (isLeft)
 import Data.List (isInfixOf, isSuffixOf, sort)
+import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
 import Data.Text (Text)
 import Data.Text qualified as T
 import Data.Text.IO qualified as TIO
+import Data.Version (showVersion)
+import Myque.Api qualified as Api
 import Myque.Cli
   ( Command (..)
   , Effect (..)
@@ -55,6 +62,7 @@ import Myque.Item
   ( Kind (..)
   , State (..)
   , WorkItem (..)
+  , bodyAfterTitle
   , decodeItem
   , encodeItem
   , itemTitle
@@ -65,11 +73,13 @@ import Myque.Item
   , parseKind
   , parseState
   , parseTag
+  , setBodyAfterTitle
   , setTitle
   , stateText
   )
 import Myque.Query (parseQuery, runQuery)
 import Myque.Render (abbreviate, idLines, jsonLines, label, mermaidGraph)
+import Myque.Storage (digestText)
 import Myque.Store
   ( Config (..)
   , Layout (..)
@@ -90,6 +100,7 @@ import Myque.Store
 import Myque.Timestamp (Timestamp, parseTimestamp, timestampText)
 import Myque.Uuid (Uuid, isUuidV7, newUuidV7, parseUuid, uuidText, uuidVersion)
 import Myque.Validate (Finding (..), findingText, validate)
+import Paths_myque (version)
 import System.Directory
   ( createDirectory
   , createDirectoryIfMissing
@@ -99,6 +110,7 @@ import System.Directory
   , withCurrentDirectory
   )
 import System.FilePath ((</>))
+import System.Process (callProcess)
 import Test.Hspec hiding (Selector)
 
 -- | A fixed instant, so encoded output is deterministic.
@@ -197,6 +209,13 @@ withScratch name = bracket create removeDirectoryRecursive
     createDirectory path
     pure path
 
+initialiseGit :: FilePath -> IO ()
+initialiseGit root = do
+  callProcess "git" ["-C", root, "init", "-q"]
+  callProcess "git" ["-C", root, "config", "user.name", "MyQue tests"]
+  callProcess "git" ["-C", root, "config", "user.email", "tests@example.invalid"]
+  callProcess "git" ["-C", root, "commit", "--allow-empty", "-qm", "initial"]
+
 main :: IO ()
 main = hspec $ do
   describe "identity" $ do
@@ -235,23 +254,16 @@ main = hspec $ do
           doc = FM.Document (FM.fromFields [("key", FM.Scalar "A1")]) body
       fmap FM.docBody (FM.parseDocument (FM.renderDocument doc)) `shouldBe` Right body
 
-    it "rejects YAML outside the supported subset" $ do
-      forM_
-        [ "---\nnested:\n  inner: 1\n---\n"
-        , "---\nflow: [a, b]\n---\n"
-        , "---\nmap: {a: 1}\n---\n"
-        , "---\nanchor: &a value\n---\n"
-        , "---\nblock: |\n  text\n---\n"
-        ]
-        (\input -> FM.parseDocument input `shouldSatisfy` isLeft)
+    it "preserves nested consumer YAML as raw entries" $ do
+      let raw = "plugin:\r\n  nested: {value: [1, true]} # keep\r\n  block: |\r\n    exact text\r\n"
+      fmap (FM.consumerEntries . FM.docFrontmatter) (FM.parseDocument ("---\n" <> raw <> "---\n")) `shouldBe` Right [("plugin", raw)]
 
     it "requires a frontmatter block" $ do
       FM.parseDocument "# Just markdown\n" `shouldSatisfy` isLeft
       FM.parseDocument "---\nkey: A1\n" `shouldSatisfy` isLeft
 
-    it "reports duplicate fields" $ do
-      fmap (FM.duplicateKeys . FM.docFrontmatter) (FM.parseDocument "---\nkey: A1\nkey: A2\n---\n")
-        `shouldBe` Right ["key"]
+    it "rejects duplicate fields" $
+      FM.parseDocument "---\nkey: A1\nkey: A2\n---\n" `shouldSatisfy` isLeft
 
   describe "item decoding" $ do
     it "decodes the specification's example" $ do
@@ -276,7 +288,7 @@ main = hspec $ do
         `shouldSatisfy` failsWith "unsupported frontmatter field: priority"
 
     it "rejects an unknown schema version" $
-      decodeItem (withField "schema" "work-item/v2" specExample)
+      decodeItem (withField "schema" "work-item/v9" specExample)
         `shouldSatisfy` failsWith "unknown schema version"
 
     it "rejects missing required fields" $
@@ -776,10 +788,12 @@ main = hspec $ do
               err `shouldSatisfy` isInfixOf "no work item with id"
             other -> expectationFailure ("expected a rejected command, got " <> show other)
 
-    it "prints the package version" $
+    it "prints the package version it was built as" $
       runCommand Version >>= \case
         Right rendered -> do
-          T.unpack (T.strip rendered) `shouldSatisfy` isInfixOf "0.1.0.0"
+          -- Pinning a literal would break at every release; the contract is
+          -- that the CLI reports its own package version.
+          T.strip rendered `shouldBe` T.pack (showVersion version)
           T.unpack rendered `shouldSatisfy` isSuffixOf "\n"
         other -> expectationFailure ("expected a version, got " <> show other)
 
@@ -894,11 +908,9 @@ main = hspec $ do
             length (storeItems store) `shouldBe` 2
           other -> expectationFailure (show' other)
 
-    it "rm deletes exactly one item" $
-      withRepo [item idA "A", item idB "B"] $ \store ->
-        case plan store later (Remove (ById (uid idA))) of
-          Right (Deleted target) -> itemId target `shouldBe` uid idA
-          other -> expectationFailure (show' other)
+    it "refuses deletion so incoming UUID links cannot be lost" $
+      withRepo [item idA "A", (item idB "B") {itemDepends = [uid idA]}] $ \store ->
+        plan store later (Remove (ById (uid idA))) `shouldSatisfy` isLeft
 
   describe "rendering" $ do
     it "labels an item by key when it has one" $
@@ -984,6 +996,88 @@ main = hspec $ do
         let rendered = jsonLines store [a]
         T.length (T.filter (== '\n') rendered) `shouldBe` 1
         T.unpack rendered `shouldSatisfy` isInfixOf "a \\\"quoted\\\"\\\\ title\\ttabbed"
+
+  describe "v2 machine API" $ do
+    it "preserves consumer bytes and opaque body through metadata writes" $ do
+      let raw = "plugin:\r\n  value: [one, {two: true}] # keep\r\n"
+          original = (setBodyAfterTitle "\r\n```zti\r\n{ x = 1; }\r\n```" (item idA "Title")) {itemConsumers = Map.singleton "plugin" raw}
+      withRepo [original] $ \store -> do
+        let loaded = head (storeItems store)
+        _ <- saveItem (storeLayout store) (setTitle "Changed" loaded)
+        reloaded <- loadStore (storeLayout store)
+        itemConsumers (head (storeItems reloaded)) `shouldBe` itemConsumers original
+        bodyAfterTitle (head (storeItems reloaded)) `shouldBe` bodyAfterTitle original
+
+    it "refuses stale writes without losing the first update" $
+      withRepo [item idA "Title"] $ \store -> do
+        let loaded = head (storeItems store)
+        _ <- saveItem (storeLayout store) (setTitle "First" loaded)
+        saveItem (storeLayout store) (setTitle "Second" loaded) `shouldThrow` anyIOException
+        reloaded <- loadStore (storeLayout store)
+        itemTitle (head (storeItems reloaded)) `shouldBe` "First"
+
+    it "admission retry preserves identity and conflicting payload refuses" $
+      withRepo [] $ \store -> do
+        let request = object ["title" .= ("Title" :: Text), "kind" .= ("task" :: Text), "body" .= ("opaque" :: Text), "consumers" .= Map.empty @Text @Text]
+        first <- Api.apiCreate (storeLayout store) "token" request
+        Api.apiCreate (storeLayout store) "token" request `shouldReturn` first
+        Api.apiCreate (storeLayout store) "token" (object ["title" .= ("Different" :: Text), "kind" .= ("task" :: Text), "body" .= ("opaque" :: Text), "consumers" .= Map.empty @Text @Text]) `shouldThrow` anyIOException
+
+    it "CAS body patch preserves other consumers and rejects old revision" $
+      withRepo [(item idA "Title") {itemConsumers = Map.singleton "other" "other:\n  id: 7\n"}] $ \store -> do
+        let loaded = head (storeItems store)
+            rev = digestText (fromMaybe (encodeItem loaded) (itemOriginal loaded))
+        _ <- Api.apiPut (storeLayout store) (uid idA) rev (object ["body" .= ("changed" :: Text)])
+        Api.apiPut (storeLayout store) (uid idA) rev (object ["body" .= ("lost" :: Text)]) `shouldThrow` anyIOException
+        reloaded <- loadStore (storeLayout store)
+        itemConsumers (head (storeItems reloaded)) `shouldBe` itemConsumers loaded
+
+  describe "terminal lifecycle" $ do
+    it "preserves done-only readiness offline and restores exact consumer/body bytes" $
+      withRepo [(item idA "Closed") {itemState = Done, itemClosed = Just epoch, itemBody = "# Closed\n\r\nopaque without newline", itemConsumers = Map.singleton "plugin" "plugin:\n  id: 9 # keep\n"}, (item idB "Waiting") {itemDepends = [uid idA]}] $ \store -> do
+        let layout = storeLayout store
+            root = layoutRoot layout
+        initialiseGit root
+        Api.retireItem layout (uid idA) "tested" Map.empty
+        retired <- loadStore layout
+        validate retired `shouldBe` []
+        map itemId (readyItems retired) `shouldBe` [uid idB]
+        Map.member (uid idA) (storeTerminals retired) `shouldBe` True
+        Api.reopenItem layout (uid idA)
+        reopened <- loadStore layout
+        let restored = Map.lookup (uid idA) (storeById reopened)
+        fmap bodyAfterTitle restored `shouldBe` Just "\r\nopaque without newline"
+        fmap itemConsumers restored `shouldBe` Just (Map.singleton "plugin" "plugin:\n  id: 9 # keep\n")
+        readyItems reopened `shouldSatisfy` all ((/= uid idB) . itemId)
+
+    it "migration changes only version and records provenance" $
+      withRepo [(item idA "Legacy") {itemSchema = "work-item/v1", itemBody = "# Legacy\r\n\r\nraw"}] $ \store -> do
+        let layout = storeLayout store
+            path = itemPath layout (uid idA)
+        initialiseGit (layoutRoot layout)
+        before <- TIO.readFile path
+        Api.migrateItem layout (uid idA)
+        TIO.readFile path `shouldReturn` T.replace "work-item/v1" "work-item/v2" before
+
+    it "replays interrupted multi-file intent before returning any snapshot" $
+      withRepo [item idA "Before"] $ \store -> do
+        let layout = storeLayout store
+            journal = [(".tasks/items/" <> T.unpack idA <> ".md", Just (encodeItem (item idA "Before")), Just (encodeItem target)), (".tasks/items/" <> T.unpack idB <> ".md", Nothing, Just (encodeItem (item idB "Created")))]
+            target = item idA "After"
+        BL.writeFile (layoutRoot layout </> ".tasks/transaction.json") (Aeson.encode journal)
+        recovered <- loadStore layout
+        map itemTitle (storeItems recovered) `shouldMatchList` ["After", "Created"]
+
+    it "missing history refuses reopen and leaves terminal identity available" $
+      withRepo [(item idA "Closed") {itemState = Cancelled, itemClosed = Just epoch}] $ \store -> do
+        let layout = storeLayout store
+            root = layoutRoot layout
+        initialiseGit root
+        Api.retireItem layout (uid idA) "cancelled with reason" Map.empty
+        removeDirectoryRecursive (root </> ".git")
+        Api.reopenItem layout (uid idA) `shouldThrow` anyIOException
+        retired <- loadStore layout
+        fmap itemState (Map.lookup (uid idA) (storeById retired)) `shouldBe` Just Cancelled
 
   describe "enumerations" $
     it "round-trips every kind and state through its wire form" $ do

@@ -1,0 +1,13 @@
+History :: type { repository: Text; commit: Text; path: Text; digest: Text; };
+Terminal :: type {
+  schema: Text;
+  metadata: Text;
+  history: History;
+  evidence: Text;
+  originalPath: Text;
+};
+{
+  schema = "terminal-item/v1";
+  terminal = schema Terminal;
+  history = schema History;
+}

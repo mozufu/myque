@@ -30,16 +30,25 @@ module Myque.Store
   , parseSelector
   , resolveSelector
   , invalidFiles
+  , TerminalRecord (..)
+  , History (..)
+  , terminalDirectory
+  , terminalPath
+  , loadStoreUnlocked
+  , saveItems
   ) where
 
-import Data.Bifunctor (first)
+import Control.Monad (unless, when)
+import Data.ByteString qualified as BS
 import Data.Char (isHexDigit)
 import Data.List (sortOn)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
 import Data.Text (Text)
 import Data.Text qualified as T
+import Data.Text.Encoding qualified as TE
 import Data.Text.IO qualified as TIO
+import Myque.Config
 import Myque.Item
   ( Key
   , WorkItem (..)
@@ -47,7 +56,10 @@ import Myque.Item
   , encodeItem
   , keyText
   , parseKey
+  , validateConsumers
   )
+import Myque.Storage (commitFiles, withStorageLock)
+import Myque.Terminal
 import Myque.Timestamp (timestampUtc)
 import Myque.Uuid (Uuid, parseUuid, uuidText)
 import System.Directory
@@ -55,72 +67,8 @@ import System.Directory
   , doesDirectoryExist
   , doesFileExist
   , listDirectory
-  , removeFile
   )
 import System.FilePath (takeBaseName, takeDirectory, takeExtension, (</>))
-
--- | Repository configuration. Deliberately minimal.
-newtype Config = Config
-  { configItemsDir :: FilePath
-  -- ^ Items directory, relative to the repository root.
-  }
-  deriving (Eq, Show)
-
--- | The configuration assumed when @.tasks\/config.toml@ is absent.
-defaultConfig :: Config
-defaultConfig = Config {configItemsDir = ".tasks/items"}
-
--- | The configuration schema identifier.
-configSchema :: Text
-configSchema = "tracker-config/v1"
-
-{- | Parse @.tasks\/config.toml@. Only the keys the tracker defines are
-recognised; the parser accepts the flat @[storage]@ table of the
-specification and rejects anything it cannot interpret.
--}
-parseConfig :: Text -> Either String Config
-parseConfig raw = go Nothing defaultConfig (zip [1 :: Int ..] (T.lines raw))
- where
-  go _ acc [] = Right acc
-  go table acc ((lineNo, line) : rest)
-    | T.null stripped || T.isPrefixOf "#" stripped = go table acc rest
-    | Just name <- T.stripSuffix "]" =<< T.stripPrefix "[" stripped = go (Just (T.strip name)) acc rest
-    | otherwise = case T.breakOn "=" stripped of
-        (_, "") -> Left (at lineNo "expected 'key = value'")
-        (rawKey, rawValue) -> do
-          value <- first (const (at lineNo "expected a quoted string value")) (tomlString (T.drop 1 rawValue))
-          case (table, T.strip rawKey) of
-            (Nothing, "schema")
-              | value == configSchema -> go table acc rest
-              | otherwise -> Left ("unknown config schema: " <> T.unpack value)
-            (Just "storage", "items") -> go table acc {configItemsDir = T.unpack value} rest
-            (_, key) -> Left (at lineNo ("unknown configuration key: " <> T.unpack (qualify table key)))
-   where
-    stripped = T.strip (fst (T.breakOn " #" line))
-  qualify table key = maybe key (\t -> t <> "." <> key) table
-  at lineNo msg = "config line " <> show lineNo <> ": " <> msg
-
--- | Parse a TOML basic or literal string.
-tomlString :: Text -> Either String Text
-tomlString raw = case T.uncons trimmed of
-  Just ('"', _) -> unquote '"'
-  Just ('\'', _) -> unquote '\''
-  _ -> Left "not a quoted string"
- where
-  trimmed = T.strip raw
-  unquote q = case T.stripPrefix (T.singleton q) trimmed >>= T.stripSuffix (T.singleton q) of
-    Nothing -> Left "unterminated string"
-    Just inner -> Right inner
-
--- | Render a configuration file.
-renderConfig :: Config -> Text
-renderConfig cfg =
-  T.unlines
-    [ "schema = \"" <> configSchema <> "\""
-    , ""
-    , "[storage]"
-    , "items = \"" <> T.pack (configItemsDir cfg) <> "\""
-    ]
 
 -- | A resolved tracker location.
 data Layout = Layout
@@ -137,6 +85,12 @@ layoutItemsDir l = layoutRoot l </> configItemsDir (layoutConfig l)
 -- | The canonical path of an item: @\<items dir\>\/\<uuid\>.md@.
 itemPath :: Layout -> Uuid -> FilePath
 itemPath l uuid = layoutItemsDir l </> T.unpack (uuidText uuid) <> ".md"
+
+terminalDirectory :: Layout -> FilePath
+terminalDirectory layout = layoutRoot layout </> ".tasks/terminal"
+
+terminalPath :: Layout -> Uuid -> FilePath
+terminalPath layout uuid = terminalDirectory layout </> T.unpack (uuidText uuid) <> ".json"
 
 {- | Find the tracker by walking up from a starting directory looking for
 @.tasks@, then load its configuration.
@@ -200,6 +154,7 @@ data Store = Store
   , storeMismatchedFiles :: [(FilePath, Uuid)]
   -- ^ Files whose basename is not the item's canonical ID.
   , storeLoadErrors :: [LoadError]
+  , storeTerminals :: Map Uuid TerminalRecord
   }
 
 -- | Every loaded item, oldest first by @created@ then by ID.
@@ -208,17 +163,27 @@ storeItems = sortOn (\i -> (timestampUtc (itemCreated i), uuidText (itemId i))) 
 
 -- | Load every @*.md@ file in the items directory.
 loadStore :: Layout -> IO Store
-loadStore layout = do
-  let dir = layoutItemsDir layout
-  present <- doesDirectoryExist dir
-  entries <- if present then listDirectory dir else pure []
-  let paths = sortOn id [dir </> e | e <- entries, takeExtension e == ".md"]
+loadStore layout = withStorageLock (layoutRoot layout) (loadStoreUnlocked layout)
+
+loadStoreUnlocked :: Layout -> IO Store
+loadStoreUnlocked layout = do
+  paths <- files (layoutItemsDir layout) ".md"
+  terminals <- files (terminalDirectory layout) ".json"
   loaded <- traverse readItem paths
-  pure (indexStore layout loaded)
+  retired <- traverse readTerminal terminals
+  let store = indexStore layout (loaded <> [(p, terminalItem <$> result) | (p, result) <- retired])
+  pure store {storeTerminals = Map.fromList [(itemId (terminalItem r), r) | (_, Right r) <- retired]}
  where
+  files dir extension = do
+    present <- doesDirectoryExist dir
+    entries <- if present then listDirectory dir else pure []
+    pure (sortOn id [dir </> e | e <- entries, takeExtension e == extension])
   readItem path = do
-    contents <- TIO.readFile path
-    pure (path, decodeItem contents)
+    contents <- TE.decodeUtf8' <$> BS.readFile path
+    pure (path, either (Left . show) decodeItem contents)
+  readTerminal path = do
+    contents <- TE.decodeUtf8' <$> BS.readFile path
+    pure (path, either (Left . show) decodeTerminal contents)
 
 -- | Build the derived index from decode results in path order.
 indexStore :: Layout -> [(FilePath, Either String WorkItem)] -> Store
@@ -232,6 +197,7 @@ indexStore layout loaded =
     , storeDuplicateKeys = duplicatesOf [(keyText k, itemId i) | (_, i) <- oks, Just k <- [itemKey i]]
     , storeMismatchedFiles = [(p, itemId i) | (p, i) <- oks, takeBaseName p /= T.unpack (uuidText (itemId i))]
     , storeLoadErrors = [LoadError p e | (p, Left e) <- loaded]
+    , storeTerminals = Map.empty
     }
  where
   oks = [(p, i) | (p, Right i) <- loaded]
@@ -247,17 +213,32 @@ indexStore layout loaded =
 -- | Write an item to its canonical path, creating the items directory.
 saveItem :: Layout -> WorkItem -> IO FilePath
 saveItem layout item = do
-  createDirectoryIfMissing True (layoutItemsDir layout)
-  let path = itemPath layout (itemId item)
-  TIO.writeFile path (encodeItem item)
-  pure path
+  saveItems layout [item]
+  pure (itemPath layout (itemId item))
 
--- | Remove an item's canonical file.
+{- | Compare the original exact bytes under the shared storage lock. New
+identities require absence; terminal records can only be changed by reopen.
+-}
+saveItems :: Layout -> [WorkItem] -> IO ()
+saveItems layout items = withStorageLock (layoutRoot layout) $ do
+  mapM_ checkItem items
+  commitFiles (layoutRoot layout) [(itemPath layout (itemId item), Just (encodeItem item)) | item <- items]
+ where
+  checkItem item = do
+    retired <- doesFileExist (terminalPath layout (itemId item))
+    when retired (ioError (userError "retired item is immutable; use myque reopen"))
+    let path = itemPath layout (itemId item)
+    exists <- doesFileExist path
+    actual <- if exists then Just . TE.decodeUtf8 <$> BS.readFile path else pure Nothing
+    unless (actual == itemOriginal item) (ioError (userError "write conflict: reload the item and retry"))
+    either (ioError . userError) pure (validateConsumers (itemConsumers item))
+    case decodeItem (encodeItem item) of
+      Left err -> ioError (userError err)
+      Right _ -> pure ()
+
+-- | UUIDs cannot be deleted: incoming links and history must remain resolvable.
 deleteItem :: Store -> WorkItem -> IO FilePath
-deleteItem store item = do
-  let path = Map.findWithDefault (itemPath (storeLayout store) (itemId item)) (itemId item) (storeSources store)
-  removeFile path
-  pure path
+deleteItem _ _ = ioError (userError "deletion is unsupported; close/cancel then retire with evidence")
 
 -- | A CLI reference to an item: a canonical ID, an abbreviated ID, or a key.
 data Selector
